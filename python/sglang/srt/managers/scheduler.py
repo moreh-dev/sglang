@@ -596,7 +596,9 @@ class Scheduler(
             )
             os.makedirs(server_args.hidden_states_dump_path, exist_ok=True)
             self.dump_stream = torch.cuda.Stream()
-            self.dump_executor = futures.ProcessPoolExecutor(max_workers=server_args.dump_worker_num)
+            self.dump_executor = futures.ProcessPoolExecutor(
+                max_workers=server_args.dump_worker_num
+            )
             self.dump_worker_idx = -1
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
