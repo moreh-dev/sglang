@@ -1031,13 +1031,13 @@ class SchedulerOutputProcessorMixin:
                             continue
                         if len(req.aux_hidden_states_for_dump) == 1:
                             continue
-                        acceptance_rate = req.accepted_tokens / (
+                        accept_rate = req.accepted_tokens / (
                             len(req.aux_hidden_states_for_dump[1:])
                             * self.server_args.speculative_num_draft_tokens
                         )
 
                         # Dump only if acceptance rate is below threshold
-                        if acceptance_rate > self.server_args.acceptance_rate_threshold:
+                        if accept_rate > self.server_args.dump_accept_rate_threshold:
                             continue
 
                         assert self.server_args.hidden_states_dump_path is not None
