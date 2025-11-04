@@ -1026,21 +1026,24 @@ class SchedulerOutputProcessorMixin:
             if self.server_args.enable_dump_hidden_states:
                 for req in reqs:
                     if req.finished():
-                        self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
-                        if self.dump_worker_idx != self.tp_rank:
-                            continue
+                        # Skip if there is only one chunk
                         if len(req.aux_hidden_states_for_dump) == 1:
                             continue
                         accept_rate = req.accepted_tokens / (
                             len(req.aux_hidden_states_for_dump[1:])
                             * self.server_args.speculative_num_draft_tokens
                         )
-
                         # Dump only if acceptance rate is below threshold
-                        if accept_rate > self.server_args.dump_accept_rate_threshold:
+                        if accept_rate >= self.server_args.dump_accept_rate_threshold:
                             continue
 
-                        assert self.server_args.hidden_states_dump_path is not None
+                        self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
+                        if self.dump_worker_idx != self.tp_rank:
+                            continue
+
+                        assert (
+                            self.server_args.hidden_states_dump_path is not None
+                        ), "hidden_states_dump_path must be set"
                         dump_path = os.path.join(
                             self.server_args.hidden_states_dump_path,
                             f"{req.rid}_data.ckpt",
@@ -1091,8 +1094,8 @@ class SchedulerOutputProcessorMixin:
         save_dict = {
             "input_ids": input_ids,
             "loss_mask": loss_mask,
-            "hidden_state": aux_hidden_states_cpu,
-            "aux_hidden_state": last_hidden_states_cpu,
+            "hidden_state": last_hidden_states_cpu,
+            "aux_hidden_state": aux_hidden_states_cpu,
         }
         torch.save(save_dict, dump_path)
 

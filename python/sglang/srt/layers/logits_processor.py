@@ -457,7 +457,7 @@ class LogitsProcessor(nn.Module):
         )
 
         hidden_states_to_store: Optional[torch.Tensor] = None
-        last_hidden_states: Optional[torch.Tensor] = None
+        last_hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
@@ -465,7 +465,7 @@ class LogitsProcessor(nn.Module):
                     hidden_states_to_store = aux_hidden_states
                 else:
                     hidden_states_to_store = hidden_states
-                last_hidden_states = hidden_states
+                last_hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
@@ -482,7 +482,7 @@ class LogitsProcessor(nn.Module):
                         if sample_indices is not None
                         else pruned_states
                     )
-                last_hidden_states = hidden_states_to_store
+                last_hidden_states_to_store = hidden_states_to_store
             else:
                 assert False, "Should never reach"
 
@@ -491,6 +491,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states_to_store,
             )
         else:
             input_logprobs = logits[input_logprob_indices]
@@ -544,7 +545,7 @@ class LogitsProcessor(nn.Module):
                 input_top_logprobs_val=input_top_logprobs_val,
                 input_top_logprobs_idx=input_top_logprobs_idx,
                 hidden_states=hidden_states_to_store,
-                last_hidden_states=last_hidden_states,
+                last_hidden_states=last_hidden_states_to_store,
                 input_token_ids_logprobs_val=input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             )
