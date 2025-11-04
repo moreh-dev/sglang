@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -138,20 +139,26 @@ class SchedulerOutputProcessorMixin:
                             )
                         logprob_pt += num_input_logprobs
 
+                    slice_range = slice(hidden_state_offset, hidden_state_offset := hidden_state_offset + len(req.origin_input_ids))
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
                         req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
+                            logits_output.hidden_states[slice_range]
                             .cpu()
                             .clone()
                             .tolist()
+                        )
+
+                    # Collect hidden states for dumping as torch.Tensor
+                    # These will be concatenated and saved later
+                    if self.server_args.enable_dump_hidden_states:
+                        req.aux_hidden_states_for_dump.append(
+                            logits_output.hidden_states[slice_range]
+                        )
+                        req.last_hidden_states_for_dump.append(
+                            logits_output.last_hidden_states[slice_range]
                         )
 
                     if req.grammar is not None:
@@ -307,6 +314,9 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        accept_len_offset = 0
+        accept_len_idx = 0
+
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.
         # We should ignore using next_token_ids for spec decoding cases.
@@ -403,6 +413,22 @@ class SchedulerOutputProcessorMixin:
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
+
+            if self.server_args.enable_dump_hidden_states:
+                if req.finished():
+                    assert len(req.aux_hidden_states_for_dump) > 0
+                    accept_len = (len(req.output_ids) - 1) - req.accepted_tokens
+                else:
+                    accept_len = batch.spec_info.accept_length_cpu[accept_len_idx] + 1 # +1 for a bonus token
+                    accept_len_idx += 1
+                req.aux_hidden_states_for_dump.append(
+                    logits_output.hidden_states[accept_len_offset : accept_len_offset + accept_len]
+                )
+                req.last_hidden_states_for_dump.append(
+                    logits_output.last_hidden_states[accept_len_offset : accept_len_offset + accept_len]
+                )
+                accept_len_offset += accept_len
+                req.accepted_tokens += accept_len
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -986,6 +1012,65 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                 )
             )
+
+            if self.server_args.enable_dump_hidden_states:
+                for req in reqs:
+                    if req.finished():
+                        self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
+                        if self.dump_worker_idx != self.tp_rank:
+                            continue
+                        if len(req.aux_hidden_states_for_dump) == 1:
+                            continue
+                        acceptance_rate = (
+                            req.accepted_tokens /
+                            (len(req.aux_hidden_states_for_dump[1:]) *
+                             self.server_args.speculative_num_draft_tokens))
+
+                        # Dump only if acceptance rate is below threshold
+                        if acceptance_rate > self.server_args.acceptance_rate_threshold:
+                            continue
+
+                        assert self.server_args.hidden_states_dump_path is not None
+                        dump_path = os.path.join(
+                            self.server_args.hidden_states_dump_path,
+                            f"{req.rid}_data.ckpt",
+                        )
+
+                        with torch.cuda.stream(self.dump_stream):
+                            aux_hidden_states = torch.cat(req.aux_hidden_states_for_dump, dim=0)
+                            last_hidden_states = torch.cat(req.last_hidden_states_for_dump, dim=0)
+                            aux_hidden_states_cpu = torch.empty_like(aux_hidden_states, device="cpu", pin_memory=True)
+                            last_hidden_states_cpu = torch.empty_like(last_hidden_states, device="cpu", pin_memory=True)
+                            aux_hidden_states_cpu.copy_(aux_hidden_states, non_blocking=True)
+                            last_hidden_states_cpu.copy_(last_hidden_states, non_blocking=True)
+
+                        self.dump_executor.submit(
+                            self._dump_hidden_states,
+                            dump_path,
+                            aux_hidden_states_cpu,
+                            last_hidden_states_cpu,
+                            req.origin_input_ids,
+                            req.output_ids
+                        )
+
+    @staticmethod
+    def _dump_hidden_states(
+        dump_path: str,
+        aux_hidden_states_cpu: torch.Tensor,
+        last_hidden_states_cpu: torch.Tensor,
+        origin_input_ids: List[int],
+        output_ids: List[int]
+    ) -> None:
+        input_ids = torch.tensor(origin_input_ids + output_ids[:-1], dtype=torch.long).view(-1)
+        loss_mask = torch.zeros_like(input_ids)
+        loss_mask[len(origin_input_ids):] = 1
+        save_dict = {
+            "input_ids": input_ids,
+            "loss_mask": loss_mask,
+            "hidden_state": aux_hidden_states_cpu,
+            "aux_hidden_state": last_hidden_states_cpu,
+        }
+        torch.save(save_dict, dump_path)
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []

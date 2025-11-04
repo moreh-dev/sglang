@@ -589,6 +589,16 @@ class Scheduler(
             ]
         )
 
+        if server_args.enable_dump_hidden_states:
+            assert server_args.hidden_states_dump_path is not None, (
+                "`hidden_states_dump_path` must be specified when "
+                "`enable_dump_hidden_states` is set"
+            )
+            os.makedirs(server_args.hidden_states_dump_path, exist_ok=True)
+            self.dump_stream = torch.cuda.Stream()
+            self.dump_executor = futures.ProcessPoolExecutor(max_workers=server_args.dump_worker_num)
+            self.dump_worker_idx = -1
+
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None

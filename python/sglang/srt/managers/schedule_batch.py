@@ -618,6 +618,8 @@ class Req:
             ) = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
+        self.aux_hidden_states_for_dump: List[torch.Tensor] = []
+        self.last_hidden_states_for_dump: List[torch.Tensor] = []
         self.output_topk_p = None
         self.output_topk_index = None
 
@@ -635,6 +637,7 @@ class Req:
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
+        self.accepted_tokens = 0
 
         # The number of accepted tokens in speculative decoding for this request.
         # This is used to compute the acceptance rate and average acceptance length per request.
