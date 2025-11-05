@@ -425,27 +425,33 @@ class SchedulerOutputProcessorMixin:
                 self.server_args.enable_dump_hidden_states
                 and logits_output.hidden_states is not None
             ):
-                if req.finished():
-                    assert len(req.hidden_states_for_dump) > 0
-                    accept_len = (len(req.output_ids) - 1) - (
-                        sum(h.shape[0] for h in req.hidden_states_for_dump[1:])
+                if batch.spec_info is not None:
+                    if req.finished():
+                        assert len(req.hidden_states_for_dump) > 0
+                        accept_len = (len(req.output_ids) - 1) - (
+                            sum(h.shape[0] for h in req.hidden_states_for_dump[1:])
+                        )
+                    else:
+                        accept_len = (
+                            batch.spec_info.accept_length_cpu[accept_len_idx] + 1
+                        )  # +1 for a bonus token
+                        accept_len_idx += 1
+                    req.hidden_states_for_dump.append(
+                        logits_output.hidden_states[
+                            accept_len_offset : accept_len_offset + accept_len
+                        ]
                     )
+                    req.last_hidden_states_for_dump.append(
+                        logits_output.last_hidden_states[
+                            accept_len_offset : accept_len_offset + accept_len
+                        ]
+                    )
+                    accept_len_offset += accept_len
                 else:
-                    accept_len = (
-                        batch.spec_info.accept_length_cpu[accept_len_idx] + 1
-                    )  # +1 for a bonus token
-                    accept_len_idx += 1
-                req.hidden_states_for_dump.append(
-                    logits_output.hidden_states[
-                        accept_len_offset : accept_len_offset + accept_len
-                    ]
-                )
-                req.last_hidden_states_for_dump.append(
-                    logits_output.last_hidden_states[
-                        accept_len_offset : accept_len_offset + accept_len
-                    ]
-                )
-                accept_len_offset += accept_len
+                    req.hidden_states_for_dump.append(logits_output.hidden_states[i])
+                    req.last_hidden_states_for_dump.append(
+                        logits_output.last_hidden_states[i]
+                    )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -1039,13 +1045,19 @@ class SchedulerOutputProcessorMixin:
                         # Skip if there is only one chunk
                         if len(req.hidden_states_for_dump) == 1:
                             continue
-                        accept_rate = req.spec_accepted_tokens / (
-                            req.spec_verify_ct
-                            * (self.server_args.speculative_num_draft_tokens - 1)
-                        )
-                        # Dump only if acceptance rate is below threshold
-                        if accept_rate > self.server_args.dump_accept_rate_threshold:
-                            continue
+
+                        if self.server_args.dump_accept_rate_threshold is not None:
+                            assert self.server_args.speculative_num_draft_tokens > 1
+                            accept_rate = req.spec_accepted_tokens / (
+                                req.spec_verify_ct
+                                * (self.server_args.speculative_num_draft_tokens - 1)
+                            )  # -1 for a bonus token
+                            # Dump only if acceptance rate is below threshold
+                            if (
+                                accept_rate
+                                > self.server_args.dump_accept_rate_threshold
+                            ):
+                                continue
 
                         self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
                         if self.dump_worker_idx != self.tp_rank:
@@ -1054,6 +1066,7 @@ class SchedulerOutputProcessorMixin:
                         assert (
                             self.server_args.hidden_states_dump_path is not None
                         ), "hidden_states_dump_path must be set"
+
                         dump_path = os.path.join(
                             self.server_args.hidden_states_dump_path,
                             f"{req.rid}_data.ckpt",

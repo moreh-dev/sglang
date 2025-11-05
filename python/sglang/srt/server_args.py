@@ -508,7 +508,7 @@ class ServerArgs:
     enable_dump_hidden_states: bool = False
     hidden_states_dump_path: Optional[str] = None
     dump_worker_num: int = 1
-    dump_accept_rate_threshold: float = 1.0
+    dump_accept_rate_threshold: Optional[float] = None
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -3356,19 +3356,19 @@ class ServerArgs:
         parser.add_argument(
             "--hidden-states-dump-path",
             type=str,
-            default=None,
+            default=ServerArgs.hidden_states_dump_path,
             help="The path to dump hidden states.",
         )
         parser.add_argument(
             "--dump-worker-num",
             type=int,
-            default=1,
+            default=ServerArgs.dump_worker_num,
             help="The number of worker processes to dump hidden states.",
         )
         parser.add_argument(
             "--dump-accept-rate-threshold",
             type=float,
-            default=1.0,
+            default=ServerArgs.dump_accept_rate_threshold,
             help="Only dump hidden states if speculative acceptance rate < threshold.",
         )
         parser.add_argument(
