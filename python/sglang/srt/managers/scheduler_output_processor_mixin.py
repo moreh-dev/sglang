@@ -427,7 +427,9 @@ class SchedulerOutputProcessorMixin:
             ):
                 if req.finished():
                     assert len(req.hidden_states_for_dump) > 0
-                    accept_len = (len(req.output_ids) - 1) - req.accepted_tokens
+                    accept_len = (len(req.output_ids) - 1) - (
+                        sum(h.shape[0] for h in req.hidden_states_for_dump[1:])
+                    )
                 else:
                     accept_len = (
                         batch.spec_info.accept_length_cpu[accept_len_idx] + 1
@@ -444,7 +446,6 @@ class SchedulerOutputProcessorMixin:
                     ]
                 )
                 accept_len_offset += accept_len
-                req.accepted_tokens += accept_len
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -1038,12 +1039,12 @@ class SchedulerOutputProcessorMixin:
                         # Skip if there is only one chunk
                         if len(req.hidden_states_for_dump) == 1:
                             continue
-                        accept_rate = req.accepted_tokens / (
-                            len(req.hidden_states_for_dump[1:])
-                            * self.server_args.speculative_num_draft_tokens
+                        accept_rate = req.spec_accepted_tokens / (
+                            req.spec_verify_ct
+                            * (self.server_args.speculative_num_draft_tokens - 1)
                         )
                         # Dump only if acceptance rate is below threshold
-                        if accept_rate >= self.server_args.dump_accept_rate_threshold:
+                        if accept_rate > self.server_args.dump_accept_rate_threshold:
                             continue
 
                         self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
