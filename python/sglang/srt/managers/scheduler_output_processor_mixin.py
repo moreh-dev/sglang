@@ -157,8 +157,11 @@ class SchedulerOutputProcessorMixin:
 
                     # Collect hidden states for dumping as torch.Tensor
                     # These will be concatenated and saved later
-                    if self.server_args.enable_dump_hidden_states:
-                        req.aux_hidden_states_for_dump.append(
+                    if (
+                        self.server_args.enable_dump_hidden_states
+                        and logits_output.hidden_states is not None
+                    ):
+                        req.hidden_states_for_dump.append(
                             logits_output.hidden_states[slice_range]
                         )
                         req.last_hidden_states_for_dump.append(
@@ -418,16 +421,19 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if self.server_args.enable_dump_hidden_states:
+            if (
+                self.server_args.enable_dump_hidden_states
+                and logits_output.hidden_states is not None
+            ):
                 if req.finished():
-                    assert len(req.aux_hidden_states_for_dump) > 0
+                    assert len(req.hidden_states_for_dump) > 0
                     accept_len = (len(req.output_ids) - 1) - req.accepted_tokens
                 else:
                     accept_len = (
                         batch.spec_info.accept_length_cpu[accept_len_idx] + 1
                     )  # +1 for a bonus token
                     accept_len_idx += 1
-                req.aux_hidden_states_for_dump.append(
+                req.hidden_states_for_dump.append(
                     logits_output.hidden_states[
                         accept_len_offset : accept_len_offset + accept_len
                     ]
@@ -1027,10 +1033,10 @@ class SchedulerOutputProcessorMixin:
                 for req in reqs:
                     if req.finished():
                         # Skip if there is only one chunk
-                        if len(req.aux_hidden_states_for_dump) == 1:
+                        if len(req.hidden_states_for_dump) == 1:
                             continue
                         accept_rate = req.accepted_tokens / (
-                            len(req.aux_hidden_states_for_dump[1:])
+                            len(req.hidden_states_for_dump[1:])
                             * self.server_args.speculative_num_draft_tokens
                         )
                         # Dump only if acceptance rate is below threshold
@@ -1050,21 +1056,17 @@ class SchedulerOutputProcessorMixin:
                         )
 
                         with torch.cuda.stream(self.dump_stream):
-                            aux_hidden_states = torch.cat(
-                                req.aux_hidden_states_for_dump, dim=0
-                            )
+                            hidden_states = torch.cat(req.hidden_states_for_dump, dim=0)
                             last_hidden_states = torch.cat(
                                 req.last_hidden_states_for_dump, dim=0
                             )
-                            aux_hidden_states_cpu = torch.empty_like(
-                                aux_hidden_states, device="cpu", pin_memory=True
+                            hidden_states_cpu = torch.empty_like(
+                                hidden_states, device="cpu", pin_memory=True
                             )
                             last_hidden_states_cpu = torch.empty_like(
                                 last_hidden_states, device="cpu", pin_memory=True
                             )
-                            aux_hidden_states_cpu.copy_(
-                                aux_hidden_states, non_blocking=True
-                            )
+                            hidden_states_cpu.copy_(hidden_states, non_blocking=True)
                             last_hidden_states_cpu.copy_(
                                 last_hidden_states, non_blocking=True
                             )
@@ -1072,7 +1074,7 @@ class SchedulerOutputProcessorMixin:
                         self.dump_executor.submit(
                             self._dump_hidden_states,
                             dump_path,
-                            aux_hidden_states_cpu,
+                            hidden_states_cpu,
                             last_hidden_states_cpu,
                             req.origin_input_ids,
                             req.output_ids,
@@ -1081,21 +1083,16 @@ class SchedulerOutputProcessorMixin:
     @staticmethod
     def _dump_hidden_states(
         dump_path: str,
-        aux_hidden_states_cpu: torch.Tensor,
+        hidden_states_cpu: torch.Tensor,
         last_hidden_states_cpu: torch.Tensor,
-        origin_input_ids: List[int],
+        input_ids: List[int],
         output_ids: List[int],
     ) -> None:
-        input_ids = torch.tensor(
-            origin_input_ids + output_ids[:-1], dtype=torch.long
-        ).view(-1)
-        loss_mask = torch.zeros_like(input_ids)
-        loss_mask[len(origin_input_ids) :] = 1
         save_dict = {
             "input_ids": input_ids,
-            "loss_mask": loss_mask,
-            "hidden_state": last_hidden_states_cpu,
-            "aux_hidden_state": aux_hidden_states_cpu,
+            "output_ids": output_ids,
+            "hidden_state": hidden_states_cpu,
+            "last_hidden_state": last_hidden_states_cpu,
         }
         torch.save(save_dict, dump_path)
 

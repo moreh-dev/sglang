@@ -618,7 +618,7 @@ class Req:
             ) = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
-        self.aux_hidden_states_for_dump: List[torch.Tensor] = []
+        self.hidden_states_for_dump: List[torch.Tensor] = []
         self.last_hidden_states_for_dump: List[torch.Tensor] = []
         self.output_topk_p = None
         self.output_topk_index = None
