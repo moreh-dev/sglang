@@ -1046,19 +1046,6 @@ class SchedulerOutputProcessorMixin:
                         if len(req.hidden_states_for_dump) == 1:
                             continue
 
-                        if self.server_args.dump_accept_rate_threshold is not None:
-                            assert self.server_args.speculative_num_draft_tokens > 1
-                            accept_rate = req.spec_accepted_tokens / (
-                                req.spec_verify_ct
-                                * (self.server_args.speculative_num_draft_tokens - 1)
-                            )  # -1 for a bonus token
-                            # Dump only if acceptance rate is below threshold
-                            if (
-                                accept_rate
-                                > self.server_args.dump_accept_rate_threshold
-                            ):
-                                continue
-
                         self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
                         if self.dump_worker_idx != self.tp_rank:
                             continue
