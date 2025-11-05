@@ -1029,7 +1029,10 @@ class SchedulerOutputProcessorMixin:
                 )
             )
 
-            if self.server_args.enable_dump_hidden_states:
+            if (
+                self.server_args.enable_dump_hidden_states
+                and req.hidden_states_for_dump
+            ):
                 for req in reqs:
                     if req.finished():
                         # Skip if there is only one chunk
