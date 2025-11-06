@@ -693,6 +693,9 @@ class EAGLEWorker(TpModelWorker):
             res.accepted_indices
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        logits_output.last_hidden_states = logits_output.last_hidden_states[
+            res.accepted_indices
+        ]
 
         if self.target_worker.model_runner.hybrid_gdn_config is not None:
             accepted_length = (

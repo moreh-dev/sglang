@@ -408,6 +408,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             out = LogitsProcessorOutput(
                 next_token_logits=out.next_token_logits[:raw_bs],
                 hidden_states=out.hidden_states[:raw_bs],
+                last_hidden_states=out.last_hidden_states[:raw_bs],
             )
             out.topk_p = out_copy.topk_p[:raw_bs]
             out.topk_index = out_copy.topk_index[:raw_bs]
