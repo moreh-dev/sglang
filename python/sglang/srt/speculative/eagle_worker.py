@@ -217,7 +217,7 @@ class EAGLEWorker(TpModelWorker):
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
-            
+
     def set_embed_and_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
@@ -246,26 +246,30 @@ class EAGLEWorker(TpModelWorker):
 
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
-    
+
     @property
     def draft_model_runner(self):
         return self.model_runner
-    
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """
         In-place update of the draft model weights from disk.
         """
-        logger.info(f"Draft model updating weights from disk: {recv_req.model_path}, format: {recv_req.load_format}")
-        success, message = self.draft_model_runner.update_weights_from_disk(
-            recv_req.model_path, recv_req.load_format
+        logger.info(
+            f"Draft model updating weights from disk: {recv_req.model_path}, format: {recv_req.load_format}"
         )
-        
-        self._set_lm_head()
-        
+        success, message = self.draft_model_runner.update_weights_from_disk(
+            recv_req.model_path,
+            recv_req.load_format,
+            is_draft_model=recv_req.is_draft_model,
+        )
+
+        self.set_embed_and_head()
+
         with self.draft_tp_context(self.draft_model_runner.tp_group):
             self.init_attention_backend()
             self.init_cuda_graphs()
-            
+
         return success, message
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:

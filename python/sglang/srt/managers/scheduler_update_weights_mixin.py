@@ -48,7 +48,7 @@ class SchedulerUpdateWeightsMixin:
         else:
             logger.info("Updating target model weights from disk")
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
-        
+
         if success:
             flush_cache_success = self.flush_cache()
             assert flush_cache_success, "Cache flush failed after updating weights"

@@ -2112,7 +2112,7 @@ class Scheduler(
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_output(HealthCheckOutput())
-    
+
     def maybe_process_pending_weight_update(self):
         if self.running_batch.is_empty() and self.pending_weight_update_queue:
             logger.info("Processing pending weight update requests")
