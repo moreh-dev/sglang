@@ -2372,9 +2372,6 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
-        # from remote_pdb import RemotePdb
-        # RemotePdb('127.0.0.1', 4444 + self.tp_rank).set_trace()
-        #     # telnet 127.0.0.1 4444 + rank
         if self._is_no_request():
             self.cur_batch = None
             self.last_batch = None
