@@ -2130,19 +2130,6 @@ class Scheduler(
                     self.send_to_tokenizer.send_output(output, req)
             self.pending_weight_update_queue.clear()
 
-    def get_idle_batch(self):
-        idle_batch = ScheduleBatch.init_new(
-            [],
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-        )
-        idle_batch.prepare_for_idle()
-        return idle_batch
-
     def move_ready_grammar_requests(self):
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
 
