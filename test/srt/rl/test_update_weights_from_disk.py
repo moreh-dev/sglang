@@ -170,6 +170,7 @@ class TestEngineUpdateDraftWeightsFromDisk(CustomTestCase):
             tp_size=4,
             mem_fraction_static=0.7,
             cuda_graph_max_bs=8,
+            context_length=2048,
             dtype="float16",
             speculative_draft_model_path=self.draft_model,
             speculative_num_steps=3,
@@ -198,24 +199,24 @@ class TestEngineUpdateDraftWeightsFromDisk(CustomTestCase):
 
     def test_update_draft_weights(self):
         origin_response = self.run_decode()
-        # Update weights: use new model (remove "-Instruct")
-        new_model_path = self.draft_model.replace("lmsys", "qywu")
-        ret = self.run_update_weights(new_model_path)
+        # Update weights: use new model
+        new_model_path = self.draft_model.replace("lmsys", "qywu").replace("LLaMA3.1", "Llama-3.1")
+        ret = self.run_update_draft_weights(new_model_path)
         self.assertTrue(ret[0])  # ret is a tuple; index 0 holds the success flag
 
         updated_response = self.run_decode()
-        self.assertNotEqual(origin_response[:32], updated_response[:32])
+        self.assertEqual(origin_response[:32], updated_response[:32])
 
         # Revert back to original weights
-        ret = self.run_update_weights(self.model)
+        ret = self.run_update_draft_weights(self.draft_model)
         self.assertTrue(ret[0])
         reverted_response = self.run_decode()
         self.assertEqual(origin_response[:32], reverted_response[:32])
 
     def test_update_weights_unexist_model(self):
         origin_response = self.run_decode()
-        new_model_path = self.model.replace("-Instruct", "wrong")
-        ret = self.run_update_weights(new_model_path)
+        new_model_path = self.draft_model.replace("-Instruct", "wrong")
+        ret = self.run_update_draft_weights(new_model_path)
         self.assertFalse(ret[0])
         updated_response = self.run_decode()
         self.assertEqual(origin_response[:32], updated_response[:32])
@@ -231,7 +232,21 @@ class TestServerUpdateDraftWeightsFromDisk(CustomTestCase):
         cls.draft_model = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            cls.model, cls.base_url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            cls.model, 
+            cls.base_url, 
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp-size", "4",
+                "--mem-fraction-static", "0.7",
+                "--cuda-graph-max-bs", "8",
+                "--context-length", "2048",
+                "--dtype", "float16",
+                "--speculative-draft-model-path", cls.draft_model,
+                "--speculative-num-steps", "3",
+                "--speculative-eagle-topk", "1",
+                "--speculative-num-draft-tokens", "4",
+                "--speculative-algorithm", "EAGLE3",
+            ],
         )
 
     @classmethod
@@ -250,58 +265,58 @@ class TestServerUpdateDraftWeightsFromDisk(CustomTestCase):
         print(f"[Server Mode] Generated text: {response.json()['text']}")
         return response.json()["text"]
 
-    def get_model_info(self):
-        response = requests.get(self.base_url + "/get_model_info")
-        model_path = response.json()["model_path"]
+    def get_draft_model_info(self):
+        response = requests.get(self.base_url + "/get_server_info")
+        model_path = response.json()["speculative_draft_model_path"]
         print(json.dumps(response.json()))
         return model_path
 
-    def run_update_weights(self, model_path):
+    def run_update_draft_weights(self, model_path):
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
-            json={"model_path": model_path},
+            json={"model_path": model_path, "is_draft_model": True},
         )
         ret = response.json()
         print(json.dumps(ret))
         return ret
 
-    def test_update_weights(self):
-        origin_model_path = self.get_model_info()
-        print(f"[Server Mode] origin_model_path: {origin_model_path}")
+    def test_update_draft_weights(self):
+        origin_draft_model_path = self.get_draft_model_info()
+        print(f"[Server Mode] origin_draft_model_path: {origin_draft_model_path}")
         origin_response = self.run_decode()
 
-        new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
-        ret = self.run_update_weights(new_model_path)
+        new_model_path = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3.replace("lmsys", "qywu").replace("LLaMA3.1", "Llama-3.1")
+        ret = self.run_update_draft_weights(new_model_path)
         self.assertTrue(ret["success"])
 
-        updated_model_path = self.get_model_info()
-        print(f"[Server Mode] updated_model_path: {updated_model_path}")
-        self.assertEqual(updated_model_path, new_model_path)
-        self.assertNotEqual(updated_model_path, origin_model_path)
-
-        updated_response = self.run_decode()
-        self.assertNotEqual(origin_response[:32], updated_response[:32])
-
-        ret = self.run_update_weights(origin_model_path)
-        self.assertTrue(ret["success"])
-        updated_model_path = self.get_model_info()
-        self.assertEqual(updated_model_path, origin_model_path)
+        updated_draft_model_path = self.get_draft_model_info()
+        print(f"[Server Mode] updated_draft_model_path: {updated_draft_model_path}")
+        self.assertEqual(updated_draft_model_path, new_model_path)
+        self.assertNotEqual(updated_draft_model_path, origin_draft_model_path)
 
         updated_response = self.run_decode()
         self.assertEqual(origin_response[:32], updated_response[:32])
 
-    def test_update_weights_unexist_model(self):
-        origin_model_path = self.get_model_info()
-        print(f"[Server Mode] origin_model_path: {origin_model_path}")
+        ret = self.run_update_draft_weights(origin_draft_model_path)
+        self.assertTrue(ret["success"])
+        updated_draft_model_path = self.get_draft_model_info()
+        self.assertEqual(updated_draft_model_path, origin_draft_model_path)
+
+        updated_response = self.run_decode()
+        self.assertEqual(origin_response[:32], updated_response[:32])
+
+    def test_update_draft_weights_unexist_model(self):
+        origin_draft_model_path = self.get_draft_model_info()
+        print(f"[Server Mode] origin_draft_model_path: {origin_draft_model_path}")
         origin_response = self.run_decode()
 
-        new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "wrong")
-        ret = self.run_update_weights(new_model_path)
+        new_model_path = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3.replace("-Instruct", "wrong")
+        ret = self.run_update_draft_weights(new_model_path)
         self.assertFalse(ret["success"])
 
-        updated_model_path = self.get_model_info()
-        print(f"[Server Mode] updated_model_path: {updated_model_path}")
-        self.assertEqual(updated_model_path, origin_model_path)
+        updated_draft_model_path = self.get_draft_model_info()
+        print(f"[Server Mode] updated_draft_model_path: {updated_draft_model_path}")
+        self.assertEqual(updated_draft_model_path, origin_draft_model_path)
 
         updated_response = self.run_decode()
         self.assertEqual(origin_response[:32], updated_response[:32])

@@ -1129,7 +1129,17 @@ class Scheduler(
             ):
                 self.return_health_check_ct += 1
                 continue
-
+            
+            if isinstance(recv_req, UpdateWeightFromDiskReqInput):
+                if not self.running_batch.is_empty():
+                    self.pending_weight_update_queue.append(recv_req)
+                    continue
+                else:
+                    output = self._request_dispatcher(recv_req)
+                    if output is not None:
+                        self.send_to_tokenizer.send_output(output, recv_req)
+                    continue
+                
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if isinstance(output, RpcReqOutput):
@@ -2114,12 +2124,12 @@ class Scheduler(
             self.send_to_tokenizer.send_output(HealthCheckOutput())
 
     def maybe_process_pending_weight_update(self):
-        if self.running_batch.is_empty() and self.pending_weight_update_queue:
+        if self._is_no_request() and self.pending_weight_update_queue:
             logger.info("Processing pending weight update requests")
             for req in self.pending_weight_update_queue:
                 output = self._request_dispatcher(req)
                 if output is not None:
-                    self.send_to_tokenizer.send_pyobj(output)
+                    self.send_to_tokenizer.send_output(output, req)
             self.pending_weight_update_queue.clear()
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
@@ -2362,6 +2372,9 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
+        # from remote_pdb import RemotePdb
+        # RemotePdb('127.0.0.1', 4444 + self.tp_rank).set_trace()
+        #     # telnet 127.0.0.1 4444 + rank
         if self._is_no_request():
             self.cur_batch = None
             self.last_batch = None
