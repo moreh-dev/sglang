@@ -200,7 +200,9 @@ class TestEngineUpdateDraftWeightsFromDisk(CustomTestCase):
     def test_update_draft_weights(self):
         origin_response = self.run_decode()
         # Update weights: use new model
-        new_model_path = self.draft_model.replace("lmsys", "qywu").replace("LLaMA3.1", "Llama-3.1")
+        new_model_path = self.draft_model.replace("lmsys", "qywu").replace(
+            "LLaMA3.1", "Llama-3.1"
+        )
         ret = self.run_update_draft_weights(new_model_path)
         self.assertTrue(ret[0])  # ret is a tuple; index 0 holds the success flag
 
@@ -232,20 +234,30 @@ class TestServerUpdateDraftWeightsFromDisk(CustomTestCase):
         cls.draft_model = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            cls.model, 
-            cls.base_url, 
+            cls.model,
+            cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--tp-size", "4",
-                "--mem-fraction-static", "0.7",
-                "--cuda-graph-max-bs", "8",
-                "--context-length", "2048",
-                "--dtype", "float16",
-                "--speculative-draft-model-path", cls.draft_model,
-                "--speculative-num-steps", "3",
-                "--speculative-eagle-topk", "1",
-                "--speculative-num-draft-tokens", "4",
-                "--speculative-algorithm", "EAGLE3",
+                "--tp-size",
+                "4",
+                "--mem-fraction-static",
+                "0.7",
+                "--cuda-graph-max-bs",
+                "8",
+                "--context-length",
+                "2048",
+                "--dtype",
+                "float16",
+                "--speculative-draft-model-path",
+                cls.draft_model,
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--speculative-algorithm",
+                "EAGLE3",
             ],
         )
 
@@ -285,7 +297,9 @@ class TestServerUpdateDraftWeightsFromDisk(CustomTestCase):
         print(f"[Server Mode] origin_draft_model_path: {origin_draft_model_path}")
         origin_response = self.run_decode()
 
-        new_model_path = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3.replace("lmsys", "qywu").replace("LLaMA3.1", "Llama-3.1")
+        new_model_path = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3.replace(
+            "lmsys", "qywu"
+        ).replace("LLaMA3.1", "Llama-3.1")
         ret = self.run_update_draft_weights(new_model_path)
         self.assertTrue(ret["success"])
 
@@ -310,7 +324,9 @@ class TestServerUpdateDraftWeightsFromDisk(CustomTestCase):
         print(f"[Server Mode] origin_draft_model_path: {origin_draft_model_path}")
         origin_response = self.run_decode()
 
-        new_model_path = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3.replace("-Instruct", "wrong")
+        new_model_path = DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3.replace(
+            "-Instruct", "wrong"
+        )
         ret = self.run_update_draft_weights(new_model_path)
         self.assertFalse(ret["success"])
 
