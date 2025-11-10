@@ -113,7 +113,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_embedding_cache
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -128,6 +128,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
@@ -216,6 +217,7 @@ class Scheduler(
     SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
+    SchedulerDPAttnMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -524,6 +526,9 @@ class Scheduler(
         # Init overlap
         self.init_overlap()
 
+        # Init mlp sync flag
+        self.require_mlp_sync = require_mlp_sync(server_args)
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -825,7 +830,7 @@ class Scheduler(
         )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
-        init_embedding_cache(embedding_cache_size * 1024 * 1024)
+        init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
@@ -1680,13 +1685,14 @@ class Scheduler(
 
         new_batch = self.get_new_batch_prefill()
 
-        need_dp_attn_preparation = require_mlp_sync(self.server_args)
-
-        if need_dp_attn_preparation and not self.spec_algorithm.is_none():
-            # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
-            # We prepare idle batches in advance to skip preparing decode batches when there are prefill batches in the group.
+        need_mlp_sync = self.require_mlp_sync
+        if need_mlp_sync and not self.spec_algorithm.is_none():
+            # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
+            # Before merging the new batch into running batch:
+            # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
+            # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.prepare_mlp_sync_batch(new_batch)
-            need_dp_attn_preparation = new_batch is None
+            need_mlp_sync = new_batch is None
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -1700,7 +1706,7 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention
-        if need_dp_attn_preparation:
+        if need_mlp_sync:
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
@@ -1972,6 +1978,10 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_start_time = current_time
 
+        # Place holder handling for pd-disagg decode event loop
+        if batch.forward_mode.is_prebuilt():
+            return self._run_batch_prebuilt(batch)
+
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
@@ -2102,10 +2112,10 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
-
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
-
+        elif batch.forward_mode.is_prebuilt():
+            self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
                 if result.copy_done is not None:
@@ -2648,12 +2658,12 @@ def run_scheduler_process(
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
     if dp_rank is not None:
         prefix += f" DP{dp_rank}"
+    if server_args.pp_size > 1:
+        prefix += f" PP{pp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
     if server_args.ep_size > 1:
         prefix += f" EP{moe_ep_rank}"
-    if server_args.pp_size > 1:
-        prefix += f" PP{pp_rank}"
 
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
