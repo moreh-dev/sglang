@@ -1059,46 +1059,139 @@ class SchedulerOutputProcessorMixin:
                             f"{req.rid}_data.ckpt",
                         )
 
-                        with torch.cuda.stream(self.dump_stream):
-                            hidden_states = torch.cat(req.hidden_states_for_dump, dim=0)
-                            last_hidden_states = torch.cat(
-                                req.last_hidden_states_for_dump, dim=0
-                            )
-                            hidden_states_cpu = torch.empty_like(
-                                hidden_states, device="cpu", pin_memory=True
-                            )
-                            last_hidden_states_cpu = torch.empty_like(
-                                last_hidden_states, device="cpu", pin_memory=True
-                            )
-                            hidden_states_cpu.copy_(hidden_states, non_blocking=True)
-                            last_hidden_states_cpu.copy_(
-                                last_hidden_states, non_blocking=True
-                            )
-
-                        self.dump_executor.submit(
-                            self._dump_hidden_states,
-                            dump_path,
-                            hidden_states_cpu,
-                            last_hidden_states_cpu,
-                            req.origin_input_ids,
-                            req.output_ids,
+                        self.preproc_thread_pool.submit(
+                            self._dump_hidden_states, req, dump_path
                         )
 
-    @staticmethod
+    def _ensure_flat_buf(
+        self,
+        name: str,
+        device,
+        dtype,
+        needed_elems: int,
+        growth: float = 1.5,
+        pin: bool = False,
+    ):
+        """
+        Reusable expandable flat buffer (1D). Grows geometrically.
+        - device: 'cuda' device like hs_chunks[0].device or 'cpu'
+        - dtype:  torch dtype
+        - needed_elems: required number of elements for this use
+        - pin: allocate pinned host memory when device == 'cpu'
+        """
+        buf_attr = f"_{name}_flat_buf"
+        cap_attr = f"_{name}_flat_cap"
+
+        buf = getattr(self, buf_attr, None)
+        cap = getattr(self, cap_attr, 0)
+
+        need_new = (
+            buf is None
+            or cap < needed_elems
+            or buf.dtype != dtype
+            or buf.device != device
+            or (pin and not buf.is_pinned())
+            or ((not pin) and getattr(buf, "is_pinned", lambda: False)())
+        )
+
+        if need_new:
+            # geometric growth to reduce realloc frequency
+            new_cap = max(needed_elems, int(needed_elems * growth))
+            if device.type == "cpu":
+                buf = torch.empty(new_cap, dtype=dtype, device="cpu", pin_memory=pin)
+            else:
+                buf = torch.empty(new_cap, dtype=dtype, device=device)
+            cap = new_cap
+            setattr(self, buf_attr, buf)
+            setattr(self, cap_attr, cap)
+
+        return buf, cap
+
     def _dump_hidden_states(
+        self: Scheduler,
+        req: Req,
         dump_path: str,
-        hidden_states_cpu: torch.Tensor,
-        last_hidden_states_cpu: torch.Tensor,
-        input_ids: List[int],
-        output_ids: List[int],
     ) -> None:
-        save_dict = {
-            "input_ids": input_ids,
-            "output_ids": output_ids,
-            "hidden_state": hidden_states_cpu,
-            "last_hidden_state": last_hidden_states_cpu,
-        }
-        torch.save(save_dict, dump_path)
+
+        with torch.cuda.stream(self.dump_stream):
+            hs_chunks = req.hidden_states_for_dump
+            lhs_chunks = req.last_hidden_states_for_dump
+
+            assert len(hs_chunks) == len(lhs_chunks)
+            assert len(hs_chunks[0].shape) == 2
+            assert hs_chunks[0].shape[0] == lhs_chunks[0].shape[0]
+            # shapes and totals
+            H = hs_chunks[0].size(1)
+            total_hs = hs_chunks[0].size(0) + len(req.output_ids) - 1
+            H_last = lhs_chunks[0].size(1)
+            total_lhs = lhs_chunks[0].size(0) + len(req.output_ids) - 1
+
+            # 1) GPU big flat buffers. View only the needed elems.
+            hs_needed_elems = total_hs * H
+            lhs_needed_elems = total_lhs * H_last
+
+            hs_flat_gpu, _ = self._ensure_flat_buf(
+                name="hs_gpu",
+                device=hs_chunks[0].device,
+                dtype=hs_chunks[0].dtype,
+                needed_elems=hs_needed_elems,
+                pin=False,
+            )
+            lhs_flat_gpu, _ = self._ensure_flat_buf(
+                name="lhs_gpu",
+                device=lhs_chunks[0].device,
+                dtype=lhs_chunks[0].dtype,
+                needed_elems=lhs_needed_elems,
+                pin=False,
+            )
+
+            # Use flat buffers to concatenate chunks
+            torch.cat(hs_chunks, out=hs_flat_gpu[:hs_needed_elems].view(total_hs, H))
+            torch.cat(
+                lhs_chunks, out=lhs_flat_gpu[:lhs_needed_elems].view(total_lhs, H_last)
+            )
+
+            # 2) Host pinned big flat buffers (reused)
+            hs_flat_cpu, _ = self._ensure_flat_buf(
+                name="hs_cpu",
+                device=torch.device("cpu"),
+                dtype=hs_chunks[0].dtype,
+                needed_elems=hs_needed_elems,
+                growth=1.5,
+                pin=True,
+            )
+            lhs_flat_cpu, _ = self._ensure_flat_buf(
+                name="lhs_cpu",
+                device=torch.device("cpu"),
+                dtype=lhs_chunks[0].dtype,
+                needed_elems=lhs_needed_elems,
+                growth=1.5,
+                pin=True,
+            )
+
+            # 3) Async D2H copies
+            hs_flat_cpu[:hs_needed_elems].copy_(
+                hs_flat_gpu[:hs_needed_elems], non_blocking=True
+            )
+            lhs_flat_cpu[:lhs_needed_elems].copy_(
+                lhs_flat_gpu[:lhs_needed_elems], non_blocking=True
+            )
+            hidden_states_cpu = hs_flat_cpu[:hs_needed_elems].view(total_hs, H)
+            last_hidden_states_cpu = lhs_flat_cpu[:lhs_needed_elems].view(
+                total_lhs, H_last
+            )
+
+            # 4) Ensure copies complete
+            _dump_ready_evt = torch.cuda.Event()
+            _dump_ready_evt.record(self.dump_stream)
+            save_dict = {
+                "input_ids": torch.tensor(req.origin_input_ids, dtype=torch.long),
+                "output_ids": torch.tensor(req.output_ids, dtype=torch.long),
+                "hidden_state": hidden_states_cpu,
+                "last_hidden_state": last_hidden_states_cpu,
+            }
+            _dump_ready_evt.synchronize()
+            self.save_proc_pool.submit(torch.save, save_dict, dump_path)
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):
         rids = []

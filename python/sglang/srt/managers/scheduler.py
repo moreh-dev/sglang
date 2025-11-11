@@ -596,7 +596,10 @@ class Scheduler(
             )
             os.makedirs(server_args.hidden_states_dump_path, exist_ok=True)
             self.dump_stream = torch.cuda.Stream()
-            self.dump_executor = futures.ProcessPoolExecutor(
+            self.preproc_thread_pool = futures.ThreadPoolExecutor(
+                max_workers=server_args.dump_worker_num
+            )
+            self.save_proc_pool = futures.ProcessPoolExecutor(
                 max_workers=server_args.dump_worker_num
             )
             self.dump_worker_idx = -1
