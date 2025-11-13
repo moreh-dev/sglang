@@ -1,5 +1,7 @@
 import logging
+import os
 import time
+from concurrent import futures
 from typing import List, Optional, Tuple
 
 import torch
@@ -8,7 +10,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import (
@@ -183,6 +185,25 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+        if server_args.enable_dump_hidden_states:
+            assert server_args.hidden_states_dump_path is not None, (
+                "`hidden_states_dump_path` must be specified when "
+                "`enable_dump_hidden_states` is set"
+            )
+            os.makedirs(server_args.hidden_states_dump_path, exist_ok=True)
+            self.dump_stream = torch.cuda.Stream()
+            self.preproc_thread_pool = futures.ThreadPoolExecutor(
+                max_workers=server_args.dump_worker_num
+            )
+            self.save_proc_pool = futures.ProcessPoolExecutor(
+                max_workers=server_args.dump_worker_num
+            )
+            self.dump_worker_idx = -1
+            self.prev_reqs: List[Req] = None
+            self.prev_hidden_states: torch.Tensor = None
+            self.prev_last_hidden_states: torch.Tensor = None
+            self.prev_accept_length_per_req_cpu: List[int] = None
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -655,6 +676,20 @@ class EAGLEWorker(TpModelWorker):
             batch_result.can_run_cuda_graph,
         )
 
+        if (
+            self.server_args.enable_dump_hidden_states
+            and self.prev_reqs is not None
+            and self.prev_hidden_states is not None
+            and self.prev_last_hidden_states is not None
+            and self.prev_accept_length_per_req_cpu is not None
+        ):
+            self.get_hidden_states_for_dump(
+                self.prev_reqs,
+                self.prev_hidden_states,
+                self.prev_last_hidden_states,
+                self.prev_accept_length_per_req_cpu,
+            )
+
         vocab_mask = None
         if batch.has_grammar:
             # Generate the logit mask for structured output.
@@ -746,6 +781,19 @@ class EAGLEWorker(TpModelWorker):
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = res.draft_input
+
+        if self.server_args.enable_dump_hidden_states:
+            self.prev_reqs = list(batch.reqs)
+            self.prev_hidden_states = logits_output.hidden_states
+            self.prev_last_hidden_states = logits_output.last_hidden_states
+            self.prev_accept_length_per_req_cpu = res.accept_length_per_req_cpu
+            # if all(req.finished() for req in self.prev_reqs):
+            #     # dump all here
+            #     self.get_hidden_states_for_dump(self.prev_reqs, self.prev_hidden_states, self.prev_last_hidden_states, self.prev_accept_length_per_req_cpu)
+            #     self.prev_reqs = None
+            #     self.prev_hidden_states = None
+            #     self.prev_last_hidden_states = None
+            #     self.prev_accept_length_per_req_cpu = None
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
@@ -975,6 +1023,164 @@ class EAGLEWorker(TpModelWorker):
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
+
+    def get_hidden_states_for_dump(
+        self,
+        reqs: List[Req],
+        hidden_states: torch.Tensor,
+        last_hidden_states: torch.Tensor,
+        accept_length_per_req_cpu: List[int],
+    ):
+        accept_len_offset = 0
+        for i, req in enumerate(reqs):
+            accept_len = accept_length_per_req_cpu[i] + 1  # +1 for a bonus token
+            req.hidden_states_for_dump.append(
+                hidden_states[accept_len_offset : accept_len_offset + accept_len]
+            )
+            req.last_hidden_states_for_dump.append(
+                last_hidden_states[accept_len_offset : accept_len_offset + accept_len]
+            )
+            accept_len_offset += accept_len
+
+            self._maybe_dump_hidden_states(req)
+
+        assert accept_len_offset == hidden_states.shape[0]
+
+    def _maybe_dump_hidden_states(self, req: Req):
+        if req.finished():
+            # Skip if there is only one chunk
+            if len(req.hidden_states_for_dump) == 1:
+                return
+
+            self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
+            if self.dump_worker_idx != self.tp_rank:
+                return
+
+            assert (
+                self.server_args.hidden_states_dump_path is not None
+            ), "hidden_states_dump_path must be set"
+
+            dump_path = os.path.join(
+                self.server_args.hidden_states_dump_path,
+                f"{req.rid}_data.ckpt",
+            )
+
+            hs_chunks = req.hidden_states_for_dump
+            lhs_chunks = req.last_hidden_states_for_dump
+
+            assert len(hs_chunks) == len(lhs_chunks)
+            assert len(hs_chunks[0].shape) == 2
+            assert hs_chunks[0].shape[0] == lhs_chunks[0].shape[0]
+            # shapes and totals
+            H = hs_chunks[0].size(1)
+            H_last = lhs_chunks[0].size(1)
+            num_hs = sum(h.shape[0] for h in hs_chunks)
+
+            # 1) GPU big flat buffers. View only the needed elems.
+            hs_needed_elems = num_hs * H
+            lhs_needed_elems = num_hs * H_last
+
+            hs_flat_gpu, _ = self._ensure_flat_buf(
+                device=hs_chunks[0].device,
+                dtype=hs_chunks[0].dtype,
+                needed_elems=hs_needed_elems,
+            )
+            lhs_flat_gpu, _ = self._ensure_flat_buf(
+                device=lhs_chunks[0].device,
+                dtype=lhs_chunks[0].dtype,
+                needed_elems=lhs_needed_elems,
+            )
+
+            # Use flat buffers to concatenate chunks
+            torch.cat(hs_chunks, out=hs_flat_gpu[:hs_needed_elems].view(num_hs, H))
+            torch.cat(
+                lhs_chunks, out=lhs_flat_gpu[:lhs_needed_elems].view(num_hs, H_last)
+            )
+
+            self.preproc_thread_pool.submit(
+                self._dump_hidden_states,
+                torch.tensor(req.origin_input_ids, dtype=torch.long),
+                torch.tensor(req.output_ids, dtype=torch.long),
+                hs_flat_gpu,
+                lhs_flat_gpu,
+                hs_needed_elems,
+                lhs_needed_elems,
+                num_hs,
+                H,
+                H_last,
+                dump_path,
+            )
+
+    def _dump_hidden_states(
+        self,
+        input_ids: torch.Tensor,
+        output_ids: torch.Tensor,
+        hs_flat_gpu: torch.Tensor,
+        lhs_flat_gpu: torch.Tensor,
+        hs_needed_elems: int,
+        lhs_needed_elems: int,
+        num_hs: int,
+        H: int,
+        H_last: int,
+        dump_path: str,
+    ) -> None:
+
+        with torch.cuda.stream(self.dump_stream):
+            hidden_states_cpu = hs_flat_gpu[:hs_needed_elems].view(num_hs, H).cpu()
+            last_hidden_states_cpu = (
+                lhs_flat_gpu[:lhs_needed_elems].view(num_hs, H_last).cpu()
+            )
+
+            save_dict = {
+                "input_ids": input_ids,
+                "output_ids": output_ids,
+                "hidden_state": hidden_states_cpu,
+                "last_hidden_state": last_hidden_states_cpu,
+            }
+
+            self.save_proc_pool.submit(torch.save, save_dict, dump_path)
+            # torch.save(save_dict, dump_path)
+
+    def _ensure_flat_buf(
+        self,
+        device: torch.device,
+        dtype,
+        needed_elems: int,
+        growth: float = 1.5,
+    ):
+        """
+        Reusable expandable flat buffer (1D). Grows geometrically.
+        - device: 'cuda' device like hs_chunks[0].device or 'cpu'
+        - dtype:  torch dtype
+        - needed_elems: required number of elements for this use
+        - pin: allocate pinned host memory when device == 'cpu'
+        """
+        device_buf_attr = f"_flat_buf"
+        # cpu_buf_attr = f"_cpu_flat_buf"
+        cap_attr = f"_flat_cap"
+
+        dev_buf = getattr(self, device_buf_attr, None)
+        # cpu_buf = getattr(self, cpu_buf_attr, None)
+        cap = getattr(self, cap_attr, 0)
+
+        need_new = (
+            dev_buf is None
+            or cap < needed_elems
+            or dev_buf.dtype != dtype
+            or dev_buf.device != device
+        )
+
+        if need_new:
+            # geometric growth to reduce realloc frequency
+            new_cap = needed_elems
+            new_cap = max(needed_elems, int(needed_elems * growth))
+            # cpu_buf = torch.empty(new_cap, dtype=dtype, device="cpu", pin_memory=True)
+            dev_buf = torch.empty(new_cap, dtype=dtype, device=device)
+            cap = new_cap
+            setattr(self, device_buf_attr, dev_buf)
+            setattr(self, cap_attr, cap)
+
+        return dev_buf, cap
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
