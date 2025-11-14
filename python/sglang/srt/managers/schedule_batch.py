@@ -714,41 +714,39 @@ class Req:
         self,
         name: str,
         device: torch.device,
-        dtype,
+        dtype: torch.dtype,
         needed_elems: int,
         growth: float = 1.5,
         min_size: int = 16 * 1024 * 1024,
     ):
         """
         Reusable expandable flat buffer (1D). Grows geometrically.
-        - device: 'cuda' device like hs_chunks[0].device or 'cpu'
-        - dtype:  torch dtype
-        - needed_elems: required number of elements for this use
-        - pin: allocate pinned host memory when device == 'cpu'
         """
         device_buf_attr = f"_{name}_flat_buf"
         cap_attr = f"_{name}_flat_cap"
 
-        dev_buf = getattr(self, device_buf_attr, None)
+        buf = getattr(self, device_buf_attr, None)
         cap = getattr(self, cap_attr, 0)
 
         need_new = (
-            dev_buf is None
+            buf is None
             or cap < needed_elems
-            or dev_buf.dtype != dtype
-            or dev_buf.device != device
+            or buf.dtype != dtype
+            or buf.device != device
         )
 
         if need_new:
             # geometric growth to reduce realloc frequency
             new_cap = needed_elems
             new_cap = max(needed_elems, int(needed_elems * growth), min_size)
-            dev_buf = torch.empty(new_cap, dtype=dtype, device=device)
+            new_buf = torch.empty(new_cap, dtype=dtype, device=device)
+            if buf is not None:
+                new_buf[: buf.numel()].copy_(buf)
             cap = new_cap
-            setattr(self, device_buf_attr, dev_buf)
+            setattr(self, device_buf_attr, new_buf)
             setattr(self, cap_attr, cap)
 
-        return dev_buf, cap
+        return buf, cap
 
     @property
     def seqlen(self):
