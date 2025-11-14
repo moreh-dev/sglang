@@ -160,11 +160,9 @@ class SchedulerOutputProcessorMixin:
                         self.server_args.enable_dump_hidden_states
                         and logits_output.hidden_states is not None
                     ):
-                        req.hidden_states_for_dump.append(
-                            logits_output.hidden_states[slice_range]
-                        )
-                        req.last_hidden_states_for_dump.append(
-                            logits_output.last_hidden_states[slice_range]
+                        req.append_hidden_states_for_dump(
+                            logits_output.hidden_states[slice_range],
+                            logits_output.last_hidden_states[slice_range],
                         )
 
                     if req.grammar is not None:
@@ -319,9 +317,6 @@ class SchedulerOutputProcessorMixin:
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
 
         self.token_to_kv_pool_allocator.free_group_begin()
-
-        accept_len_offset = 0
-        accept_len_idx = 0
 
         # Check finish condition
         # NOTE: the length of reqs and next_token_ids don't match if it is spec decoding.

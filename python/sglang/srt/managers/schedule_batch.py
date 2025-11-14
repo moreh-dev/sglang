@@ -618,8 +618,9 @@ class Req:
             ) = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
-        self.hidden_states_for_dump: List[torch.Tensor] = []
-        self.last_hidden_states_for_dump: List[torch.Tensor] = []
+        self.hidden_states_for_dump: torch.Tensor = None
+        self.last_hidden_states_for_dump: torch.Tensor = None
+        self.dump_tokens: int = 0
         self.output_topk_p = None
         self.output_topk_index = None
 
@@ -675,6 +676,79 @@ class Req:
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+
+    def append_hidden_states_for_dump(
+        self, hidden_states: torch.Tensor, last_hidden_states: torch.Tensor
+    ):
+        num_new_tokens = hidden_states.shape[0]
+        H = hidden_states.shape[1]
+        H_last = last_hidden_states.shape[1]
+
+        hs_buf, _ = self._ensure_hs_buf(
+            "hs_for_dump",
+            hidden_states.device,
+            hidden_states.dtype,
+            self.dump_tokens * H + hidden_states.numel(),
+        )
+        hs_buf[self.dump_tokens * H : (self.dump_tokens + num_new_tokens) * H] = (
+            hidden_states.view(-1)
+        )
+        lhs_buf, _ = self._ensure_hs_buf(
+            "last_hs_for_dump",
+            last_hidden_states.device,
+            last_hidden_states.dtype,
+            self.dump_tokens * H_last + last_hidden_states.numel(),
+        )
+        lhs_buf[
+            self.dump_tokens * H_last : (self.dump_tokens + num_new_tokens) * H_last
+        ] = last_hidden_states.view(-1)
+        self.dump_tokens += num_new_tokens
+        self.hidden_states_for_dump = hs_buf[: self.dump_tokens * H].view(
+            self.dump_tokens, H
+        )
+        self.last_hidden_states_for_dump = lhs_buf[: self.dump_tokens * H_last].view(
+            self.dump_tokens, H_last
+        )
+
+    def _ensure_hs_buf(
+        self,
+        name: str,
+        device: torch.device,
+        dtype,
+        needed_elems: int,
+        growth: float = 1.5,
+        min_size: int = 16 * 1024 * 1024,
+    ):
+        """
+        Reusable expandable flat buffer (1D). Grows geometrically.
+        - device: 'cuda' device like hs_chunks[0].device or 'cpu'
+        - dtype:  torch dtype
+        - needed_elems: required number of elements for this use
+        - pin: allocate pinned host memory when device == 'cpu'
+        """
+        device_buf_attr = f"_{name}_flat_buf"
+        cap_attr = f"_{name}_flat_cap"
+
+        dev_buf = getattr(self, device_buf_attr, None)
+        cap = getattr(self, cap_attr, 0)
+
+        need_new = (
+            dev_buf is None
+            or cap < needed_elems
+            or dev_buf.dtype != dtype
+            or dev_buf.device != device
+        )
+
+        if need_new:
+            # geometric growth to reduce realloc frequency
+            new_cap = needed_elems
+            new_cap = max(needed_elems, int(needed_elems * growth), min_size)
+            dev_buf = torch.empty(new_cap, dtype=dtype, device=device)
+            cap = new_cap
+            setattr(self, device_buf_attr, dev_buf)
+            setattr(self, cap_attr, cap)
+
+        return dev_buf, cap
 
     @property
     def seqlen(self):
