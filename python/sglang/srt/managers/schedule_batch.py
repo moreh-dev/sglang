@@ -745,6 +745,7 @@ class Req:
             cap = new_cap
             setattr(self, device_buf_attr, new_buf)
             setattr(self, cap_attr, cap)
+            return new_buf, cap
 
         return buf, cap
 
