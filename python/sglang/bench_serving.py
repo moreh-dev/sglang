@@ -1651,6 +1651,7 @@ def calculate_metrics(
         and accept_length > 0
         and backend in ("sglang-oai", "sglang-oai-chat")
     )
+    use_retokenized_itl = False
 
     for i in range(len(outputs)):
         if outputs[i].success:

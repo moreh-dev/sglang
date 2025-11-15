@@ -1062,15 +1062,37 @@ class EAGLEWorker(TpModelWorker):
             f"{req.rid}_data.ckpt",
         )
 
-        finished_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+        self.save_proc_pool.submit(
+            _dump_hidden_states,
+            dump_path,
+            req.hidden_states_for_dump[: req.seqlen - 1],
+            req.last_hidden_states_for_dump[: req.seqlen - 1],
+            req.origin_input_ids,
+            req.output_ids,
+        )
 
-        save_dict = {
-            "input_ids": torch.tensor(req.origin_input_ids, dtype=torch.long),
-            "output_ids": torch.tensor(req.output_ids, dtype=torch.long),
-            "hidden_state": req.hidden_states_for_dump[:finished_len],
-            "last_hidden_state": req.last_hidden_states_for_dump[:finished_len],
-        }
-        self.save_proc_pool.submit(torch.save, save_dict, dump_path)
+
+@staticmethod
+def _dump_hidden_states(
+    dump_path: str,
+    aux_hidden_states_cpu: torch.Tensor,
+    last_hidden_states_cpu: torch.Tensor,
+    origin_input_ids: List[int],
+    output_ids: List[int],
+):
+    input_ids = torch.tensor(origin_input_ids + output_ids[:-1], dtype=torch.long).view(
+        -1
+    )
+    loss_mask = torch.zeros_like(input_ids)
+    loss_mask[len(origin_input_ids) :] = 1
+    save_dict = {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "hidden_state": last_hidden_states_cpu,
+        "aux_hidden_state": aux_hidden_states_cpu,
+    }
+    torch.save(save_dict, dump_path)
+
 
 @torch.compile(dynamic=True, disable=_is_npu)
 def get_last_loc_large_page_size_top_k_1(
