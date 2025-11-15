@@ -1032,8 +1032,14 @@ class EAGLEWorker(TpModelWorker):
         with torch.cuda.stream(self.dump_stream):
             hidden_states = hidden_states.cpu()
             last_hidden_states = last_hidden_states.cpu()
+
         accept_len_offset = 0
         for i, req in enumerate(reqs):
+            if req.dump_tokens == 0:
+                req.append_hidden_states_for_dump(
+                    req.hidden_states_for_dump.cpu(),
+                    req.last_hidden_states_for_dump.cpu(),
+                )
             accept_len = accept_length_per_req_cpu[i] + 1  # +1 for a bonus token
             req.append_hidden_states_for_dump(
                 hidden_states[accept_len_offset : accept_len_offset + accept_len],
@@ -1072,7 +1078,6 @@ class EAGLEWorker(TpModelWorker):
         )
 
 
-@staticmethod
 def _dump_hidden_states(
     dump_path: str,
     aux_hidden_states_cpu: torch.Tensor,

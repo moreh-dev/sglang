@@ -160,9 +160,11 @@ class SchedulerOutputProcessorMixin:
                         self.server_args.enable_dump_hidden_states
                         and logits_output.hidden_states is not None
                     ):
-                        req.append_hidden_states_for_dump(
-                            logits_output.hidden_states[slice_range],
-                            logits_output.last_hidden_states[slice_range],
+                        req.hidden_states_for_dump = logits_output.hidden_states[
+                            slice_range
+                        ]
+                        req.last_hidden_states_for_dump = (
+                            logits_output.last_hidden_states[slice_range]
                         )
 
                     if req.grammar is not None:
