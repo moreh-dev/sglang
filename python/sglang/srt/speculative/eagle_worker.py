@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from collections import deque
 from concurrent import futures
 from typing import List, Optional, Tuple
 
@@ -197,6 +198,7 @@ class EAGLEWorker(TpModelWorker):
                 max_workers=server_args.dump_worker_num
             )
             self.dump_worker_idx = -1
+            self.dump_buffer_pool: deque = deque()
             self.prev_reqs: List[Req] = None
             self.prev_logits_output: LogitsProcessorOutput = None
             self.prev_accept_length_per_req_cpu: List[int] = None
@@ -1036,6 +1038,13 @@ class EAGLEWorker(TpModelWorker):
         accept_len_offset = 0
         for i, req in enumerate(reqs):
             if req.dump_tokens == 0:
+                if self.dump_buffer_pool:
+                    hs_buf, hs_cap, lhs_buf, lhs_cap = self.dump_buffer_pool.popleft()
+                    setattr(req, "_hs_for_dump_flat_buf", hs_buf)
+                    setattr(req, "_hs_for_dump_flat_cap", hs_cap)
+                    setattr(req, "_last_hs_for_dump_flat_buf", lhs_buf)
+                    setattr(req, "_last_hs_for_dump_flat_cap", lhs_cap)
+
                 req.append_hidden_states_for_dump(
                     req.hidden_states_for_dump.cpu(),
                     req.last_hidden_states_for_dump.cpu(),
@@ -1048,6 +1057,16 @@ class EAGLEWorker(TpModelWorker):
             accept_len_offset += accept_len
 
             self._maybe_dump_hidden_states(req)
+
+            if req.finished():
+                self.dump_buffer_pool.append(
+                    (
+                        getattr(req, "_hs_for_dump_flat_buf"),
+                        getattr(req, "_hs_for_dump_flat_cap"),
+                        getattr(req, "_last_hs_for_dump_flat_buf"),
+                        getattr(req, "_last_hs_for_dump_flat_cap"),
+                    )
+                )
 
         assert accept_len_offset == hidden_states.shape[0]
 

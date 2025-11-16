@@ -716,8 +716,8 @@ class Req:
         device: torch.device,
         dtype: torch.dtype,
         needed_elems: int,
-        growth: float = 1.5,
-        min_size: int = 16 * 1024 * 1024,
+        growth: float = 2.0,
+        min_elem: int = 32 * 1024 * 1024,
     ):
         """
         Reusable expandable flat buffer (1D). Grows geometrically.
@@ -738,7 +738,7 @@ class Req:
         if need_new:
             # geometric growth to reduce realloc frequency
             new_cap = needed_elems
-            new_cap = max(needed_elems, int(needed_elems * growth), min_size)
+            new_cap = max(needed_elems, int(needed_elems * growth), min_elem)
             new_buf = torch.empty(new_cap, dtype=dtype, device=device)
             if buf is not None:
                 new_buf[: buf.numel()].copy_(buf)
