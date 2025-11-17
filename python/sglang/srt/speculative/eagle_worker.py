@@ -1108,6 +1108,14 @@ class EAGLEWorker(TpModelWorker):
             self.server_args.hidden_states_dump_path is not None
         ), "hidden_states_dump_path must be set"
 
+        if self.server_args.acceptance_rate_threshold < 1.0:
+            acceptance_rate = (req.spec_accepted_tokens + req.spec_verify_ct) / (
+                req.spec_verify_ct * self.server_args.speculative_num_draft_tokens
+            )
+            # Skip dump if acceptance rate is higher than threshold
+            if acceptance_rate >= self.server_args.acceptance_rate_threshold:
+                return
+
         dump_path = os.path.join(
             self.server_args.hidden_states_dump_path,
             f"{req.rid}_data.ckpt",
