@@ -872,6 +872,20 @@ class ModelRunner:
 
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
+        if is_draft_model:
+            new_draft_model_config = ModelConfig.from_server_args(
+                    self.server_args,
+                    model_path=model_path,
+                    is_draft_model=True,
+                )
+            draft_vocab_size = getattr(
+                new_draft_model_config.hf_config, "draft_vocab_size", None
+            )
+            if draft_vocab_size is not None:
+                self.model.load_lm_head_from_target = False 
+            else:
+                self.model.load_lm_head_from_target = True
+            
         load_config = LoadConfig(load_format=load_format)
 
         # Only support DefaultModelLoader for now

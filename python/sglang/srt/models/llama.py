@@ -703,9 +703,9 @@ class LlamaForCausalLM(nn.Module):
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
-        del self.lm_head.weight
         self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        with torch.no_grad():
+            self.lm_head.weight.data.copy_(head.data)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
