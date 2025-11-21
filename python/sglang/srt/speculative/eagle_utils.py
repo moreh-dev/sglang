@@ -228,6 +228,7 @@ class DumpHiddenStateWorker:
         )
         self.dump_worker_idx: int = -1
         self.payloads: HiddenStateDumpPayload = None
+        self.dump_tokens = {}
 
         os.makedirs(server_args.hidden_states_dump_path, exist_ok=True)
 
@@ -259,37 +260,18 @@ class DumpHiddenStateWorker:
             hidden_states = hidden_states.cpu()
             last_hidden_states = last_hidden_states.cpu()
 
-        device = hidden_states.device
-        dtype = hidden_states.dtype
-
         accept_len_offset = 0
         for i, req in enumerate(reqs):
-            if req.dump_tokens == 0:
-                hs_buf = self.buffer_pool.get_buffer(
-                    f"{req.rid}_hs",
-                    dtype,
-                    device,
-                    hidden_states.numel(),
-                )
-                lhs_buf = self.buffer_pool.get_buffer(
-                    f"{req.rid}_lhs",
-                    dtype,
-                    device,
-                    last_hidden_states.numel(),
-                )
-                hs_cap = hs_buf.numel()
-                lhs_cap = lhs_buf.numel()
-                setattr(req, "_hs_for_dump_flat_buf", hs_buf)
-                setattr(req, "_hs_for_dump_flat_cap", hs_cap)
-                setattr(req, "_last_hs_for_dump_flat_buf", lhs_buf)
-                setattr(req, "_last_hs_for_dump_flat_cap", lhs_cap)
-
-                req.append_hidden_states_for_dump(
+            if req.rid not in self.dump_tokens:
+                self.dump_tokens[req.rid] = 0
+                self.append_hidden_states_for_dump(
+                    req,
                     req.hidden_states_for_dump.cpu(),
                     req.last_hidden_states_for_dump.cpu(),
                 )
             accept_len = accept_length_per_req_cpu[i] + 1  # +1 for a bonus token
-            req.append_hidden_states_for_dump(
+            self.append_hidden_states_for_dump(
+                req,
                 hidden_states[accept_len_offset : accept_len_offset + accept_len],
                 last_hidden_states[accept_len_offset : accept_len_offset + accept_len],
             )
@@ -300,9 +282,43 @@ class DumpHiddenStateWorker:
             if req.finished():
                 self.buffer_pool.release_buffer(f"{req.rid}_hs")
                 self.buffer_pool.release_buffer(f"{req.rid}_lhs")
+                self.dump_tokens.pop(req.rid)
 
         assert accept_len_offset == hidden_states.shape[0]
         self.payloads = None
+
+    def append_hidden_states_for_dump(
+        self, req: Req, hidden_states: torch.Tensor, last_hidden_states: torch.Tensor
+    ):
+        num_new_tokens = hidden_states.shape[0]
+        H = hidden_states.shape[1]
+        H_last = last_hidden_states.shape[1]
+        dump_tokens = self.dump_tokens[req.rid]
+
+        hs_buf = self.buffer_pool.get_buffer(
+            f"{req.rid}_hs",
+            hidden_states.device,
+            hidden_states.dtype,
+            dump_tokens * H + hidden_states.numel(),
+        )
+        hs_buf[dump_tokens * H : (dump_tokens + num_new_tokens) * H] = (
+            hidden_states.view(-1)
+        )
+        lhs_buf = self.buffer_pool.get_buffer(
+            f"{req.rid}_lhs",
+            last_hidden_states.device,
+            last_hidden_states.dtype,
+            dump_tokens * H_last + last_hidden_states.numel(),
+        )
+        lhs_buf[dump_tokens * H_last : (dump_tokens + num_new_tokens) * H_last] = (
+            last_hidden_states.view(-1)
+        )
+        dump_tokens += num_new_tokens
+        req.hidden_states_for_dump = hs_buf[: dump_tokens * H].view(dump_tokens, H)
+        req.last_hidden_states_for_dump = lhs_buf[: dump_tokens * H_last].view(
+            dump_tokens, H_last
+        )
+        self.dump_tokens[req.rid] = dump_tokens
 
     def _maybe_dump_hidden_states(self, req: Req):
         if not req.finished():
@@ -330,7 +346,7 @@ class DumpHiddenStateWorker:
         )
 
         self.dump_executor.submit(
-            _dump_hidden_states,
+            dump_hidden_states,
             dump_path,
             req.hidden_states_for_dump[: req.seqlen - 1],
             req.last_hidden_states_for_dump[: req.seqlen - 1],
@@ -339,10 +355,10 @@ class DumpHiddenStateWorker:
         )
 
 
-def _dump_hidden_states(
+def dump_hidden_states(
     dump_path: str,
-    aux_hidden_states_cpu: torch.Tensor,
-    last_hidden_states_cpu: torch.Tensor,
+    hidden_states: torch.Tensor,
+    aux_hidden_states: torch.Tensor,
     origin_input_ids: List[int],
     output_ids: List[int],
 ):
@@ -354,8 +370,8 @@ def _dump_hidden_states(
     save_dict = {
         "input_ids": input_ids,
         "loss_mask": loss_mask,
-        "hidden_state": last_hidden_states_cpu,
-        "aux_hidden_state": aux_hidden_states_cpu,
+        "hidden_state": hidden_states,
+        "aux_hidden_state": aux_hidden_states,
     }
     torch.save(save_dict, dump_path)
 
@@ -368,8 +384,8 @@ class DumpBufferPool:
     def get_buffer(
         self,
         key: str,
-        dtype: torch.dtype,
         device: torch.device,
+        dtype: torch.dtype,
         needed_elems: int,
     ):
         return self._ensure_buf(key, device, dtype, needed_elems)
@@ -395,11 +411,13 @@ class DumpBufferPool:
         buf = self.pool[key] if key in self.pool else None
         if buf is None:
             buf = self.available_buffers.popleft() if self.available_buffers else None
+            if buf is not None:
+                self.pool[key] = buf
 
         need_new = (
             buf is None
-            or buf.dtype != dtype
             or buf.device != device
+            or buf.dtype != dtype
             or buf.numel() < needed_elems
         )
 
@@ -408,7 +426,7 @@ class DumpBufferPool:
             cap = max(needed_elems, min_elem)
             if buf is not None and buf.numel() < needed_elems:
                 cap = max(int(buf.numel() * growth), cap)
-            new_buf = torch.empty(cap, dtype=dtype, device=device)
+            new_buf = torch.empty(cap, device=device, dtype=dtype)
             if buf is not None and buf.dtype == dtype and buf.device == device:
                 new_buf[: buf.numel()].copy_(buf)
             self.pool[key] = new_buf
