@@ -524,6 +524,10 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
+    enable_dump_hidden_states: bool = False
+    hidden_states_dump_path: Optional[str] = None
+    dump_worker_num: int = 1
+    acceptance_rate_threshold: float = 1.0
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -3544,6 +3548,29 @@ class ServerArgs:
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
+            "--enable-dump-hidden-states",
+            action="store_true",
+            help="Enable dumping hidden states to the specified path.",
+        )
+        parser.add_argument(
+            "--hidden-states-dump-path",
+            type=str,
+            default=ServerArgs.hidden_states_dump_path,
+            help="The path to dump hidden states.",
+        )
+        parser.add_argument(
+            "--acceptance-rate-threshold",
+            type=float,
+            default=1.0,
+            help="Only dump hidden states if speculative acceptance rate < threshold.",
+        )
+        parser.add_argument(
+            "--dump-worker-num",
+            type=int,
+            default=ServerArgs.dump_worker_num,
+            help="The number of worker processes to dump hidden states.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",
