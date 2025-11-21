@@ -1,9 +1,14 @@
 import math
+import os
+from collections import deque
+from concurrent import futures
 from enum import IntEnum
 from typing import List, Optional
 
 import torch
+from gguf import dataclass
 
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
@@ -197,3 +202,216 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     return predicts, accept_index, accept_token_num
+
+
+@dataclass
+class HiddenStateDumpPayload:
+    reqs: List[Req]
+    hidden_states: torch.Tensor
+    last_hidden_states: torch.Tensor
+    accept_length_per_req_cpu: List[int]
+
+
+from sglang.srt.server_args import ServerArgs
+
+
+class DumpHiddenStateWorker:
+    def __init__(self, server_args: ServerArgs, tp_rank: int = 0, tp_size: int = 1):
+        self.server_args = server_args
+        self.dump_path: str = server_args.hidden_states_dump_path
+        self.tp_rank: int = tp_rank
+        self.tp_size: int = tp_size
+        self.dump_stream = torch.cuda.Stream()
+        self.buffer_pool = DumpBufferPool(available_size=256)
+        self.dump_executor = futures.ProcessPoolExecutor(
+            max_workers=server_args.dump_worker_num,
+        )
+        self.dump_worker_idx: int = -1
+        self.payloads: HiddenStateDumpPayload = None
+
+        os.makedirs(server_args.hidden_states_dump_path, exist_ok=True)
+
+    def register_payload(
+        self,
+        reqs: List[Req],
+        hidden_states: torch.Tensor,
+        last_hidden_states: torch.Tensor,
+        accept_length_per_req_cpu: List[int],
+    ):
+        self.payloads = HiddenStateDumpPayload(
+            reqs=reqs,
+            hidden_states=hidden_states,
+            last_hidden_states=last_hidden_states,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+        )
+
+    def get_hidden_states_for_dump(
+        self,
+    ):
+        if self.payloads is None:
+            return
+
+        reqs = self.payloads.reqs
+        hidden_states = self.payloads.hidden_states
+        last_hidden_states = self.payloads.last_hidden_states
+        accept_length_per_req_cpu = self.payloads.accept_length_per_req_cpu
+        with torch.cuda.stream(self.dump_stream):
+            hidden_states = hidden_states.cpu()
+            last_hidden_states = last_hidden_states.cpu()
+
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        accept_len_offset = 0
+        for i, req in enumerate(reqs):
+            if req.dump_tokens == 0:
+                hs_buf = self.buffer_pool.get_buffer(
+                    f"{req.rid}_hs",
+                    dtype,
+                    device,
+                    hidden_states.numel(),
+                )
+                lhs_buf = self.buffer_pool.get_buffer(
+                    f"{req.rid}_lhs",
+                    dtype,
+                    device,
+                    last_hidden_states.numel(),
+                )
+                hs_cap = hs_buf.numel()
+                lhs_cap = lhs_buf.numel()
+                setattr(req, "_hs_for_dump_flat_buf", hs_buf)
+                setattr(req, "_hs_for_dump_flat_cap", hs_cap)
+                setattr(req, "_last_hs_for_dump_flat_buf", lhs_buf)
+                setattr(req, "_last_hs_for_dump_flat_cap", lhs_cap)
+
+                req.append_hidden_states_for_dump(
+                    req.hidden_states_for_dump.cpu(),
+                    req.last_hidden_states_for_dump.cpu(),
+                )
+            accept_len = accept_length_per_req_cpu[i] + 1  # +1 for a bonus token
+            req.append_hidden_states_for_dump(
+                hidden_states[accept_len_offset : accept_len_offset + accept_len],
+                last_hidden_states[accept_len_offset : accept_len_offset + accept_len],
+            )
+            accept_len_offset += accept_len
+
+            self._maybe_dump_hidden_states(req)
+
+            if req.finished():
+                self.buffer_pool.release_buffer(f"{req.rid}_hs")
+                self.buffer_pool.release_buffer(f"{req.rid}_lhs")
+
+        assert accept_len_offset == hidden_states.shape[0]
+        self.payloads = None
+
+    def _maybe_dump_hidden_states(self, req: Req):
+        if not req.finished():
+            return
+
+        self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
+        if self.dump_worker_idx != self.tp_rank:
+            return
+
+        assert (
+            self.server_args.hidden_states_dump_path is not None
+        ), "hidden_states_dump_path must be set"
+
+        if self.server_args.acceptance_rate_threshold < 1.0:
+            acceptance_rate = (req.spec_accepted_tokens + req.spec_verify_ct) / (
+                req.spec_verify_ct * self.server_args.speculative_num_draft_tokens
+            )
+            # Skip dump if acceptance rate is higher than threshold
+            if acceptance_rate >= self.server_args.acceptance_rate_threshold:
+                return
+
+        dump_path = os.path.join(
+            self.server_args.hidden_states_dump_path,
+            f"{req.rid}_data.ckpt",
+        )
+
+        self.dump_executor.submit(
+            _dump_hidden_states,
+            dump_path,
+            req.hidden_states_for_dump[: req.seqlen - 1],
+            req.last_hidden_states_for_dump[: req.seqlen - 1],
+            req.origin_input_ids,
+            req.output_ids,
+        )
+
+
+def _dump_hidden_states(
+    dump_path: str,
+    aux_hidden_states_cpu: torch.Tensor,
+    last_hidden_states_cpu: torch.Tensor,
+    origin_input_ids: List[int],
+    output_ids: List[int],
+):
+    input_ids = torch.tensor(origin_input_ids + output_ids[:-1], dtype=torch.long).view(
+        -1
+    )
+    loss_mask = torch.zeros_like(input_ids)
+    loss_mask[len(origin_input_ids) :] = 1
+    save_dict = {
+        "input_ids": input_ids,
+        "loss_mask": loss_mask,
+        "hidden_state": last_hidden_states_cpu,
+        "aux_hidden_state": aux_hidden_states_cpu,
+    }
+    torch.save(save_dict, dump_path)
+
+
+class DumpBufferPool:
+    def __init__(self, available_size: int = 256):
+        self.pool = dict()
+        self.available_buffers = deque(maxlen=available_size)
+
+    def get_buffer(
+        self,
+        key: str,
+        dtype: torch.dtype,
+        device: torch.device,
+        needed_elems: int,
+    ):
+        return self._ensure_buf(key, device, dtype, needed_elems)
+
+    def release_buffer(self, key: str):
+        if key in self.pool:
+            self.available_buffers.append(self.pool[key])
+            del self.pool[key]
+
+    def _ensure_buf(
+        self,
+        key: str,
+        device: torch.device,
+        dtype: torch.dtype,
+        needed_elems: int,
+        growth: float = 2.0,
+        min_elem: int = 32 * 1024 * 1024,
+    ):
+        """
+        Reusable expandable flat buffer (1D). Grows geometrically.
+        """
+
+        buf = self.pool[key] if key in self.pool else None
+        if buf is None:
+            buf = self.available_buffers.popleft() if self.available_buffers else None
+
+        need_new = (
+            buf is None
+            or buf.dtype != dtype
+            or buf.device != device
+            or buf.numel() < needed_elems
+        )
+
+        if need_new:
+            # geometric growth to reduce realloc frequency
+            cap = max(needed_elems, min_elem)
+            if buf is not None and buf.numel() < needed_elems:
+                cap = max(int(buf.numel() * growth), cap)
+            new_buf = torch.empty(cap, dtype=dtype, device=device)
+            if buf is not None and buf.dtype == dtype and buf.device == device:
+                new_buf[: buf.numel()].copy_(buf)
+            self.pool[key] = new_buf
+            return new_buf
+
+        return buf

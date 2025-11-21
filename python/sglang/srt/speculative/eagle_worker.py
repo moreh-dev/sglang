@@ -1,8 +1,5 @@
 import logging
-import os
 import time
-from collections import deque
-from concurrent import futures
 from typing import List, Optional, Tuple
 
 import torch
@@ -13,7 +10,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import (
@@ -41,6 +38,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    DumpHiddenStateWorker,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -200,16 +198,9 @@ class EAGLEWorker(TpModelWorker):
                 "`hidden_states_dump_path` must be specified when "
                 "`enable_dump_hidden_states` is set"
             )
-            os.makedirs(server_args.hidden_states_dump_path, exist_ok=True)
-            self.dump_stream = torch.cuda.Stream()
-            self.save_proc_pool = futures.ProcessPoolExecutor(
-                max_workers=server_args.dump_worker_num
+            self.dump_worker = DumpHiddenStateWorker(
+                server_args, tp_rank=self.tp_rank, tp_size=self.tp_size
             )
-            self.dump_worker_idx = -1
-            self.dump_buffer_pool: deque = deque()
-            self.prev_reqs: List[Req] = None
-            self.prev_logits_output: LogitsProcessorOutput = None
-            self.prev_accept_length_per_req_cpu: List[int] = None
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -696,21 +687,11 @@ class EAGLEWorker(TpModelWorker):
             batch_result.can_run_cuda_graph,
         )
 
-        if self.server_args.enable_dump_hidden_states:
-            if (
-                self.prev_reqs is not None
-                and self.prev_logits_output.hidden_states is not None
-                and self.prev_logits_output.last_hidden_states is not None
-                and self.prev_accept_length_per_req_cpu is not None
-            ):
-                self.get_hidden_states_for_dump(
-                    self.prev_reqs,
-                    self.prev_logits_output.hidden_states,
-                    self.prev_logits_output.last_hidden_states,
-                    self.prev_accept_length_per_req_cpu,
-                )
-            self.prev_reqs = list(batch.reqs)
-            self.prev_logits_output = logits_output
+        if (
+            self.server_args.enable_dump_hidden_states
+            and self.dump_worker.payloads is not None
+        ):
+            self.dump_worker.get_hidden_states_for_dump()
 
         vocab_mask = None
         if batch.has_grammar:
@@ -805,17 +786,14 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = res.draft_input
 
         if self.server_args.enable_dump_hidden_states:
-            self.prev_accept_length_per_req_cpu = res.accept_length_per_req_cpu
-            if all(req.finished() for req in self.prev_reqs):
-                self.get_hidden_states_for_dump(
-                    self.prev_reqs,
-                    self.prev_logits_output.hidden_states,
-                    self.prev_logits_output.last_hidden_states,
-                    self.prev_accept_length_per_req_cpu,
-                )
-                self.prev_reqs = None
-                self.prev_logits_output = None
-                self.prev_accept_length_per_req_cpu = None
+            self.dump_worker.register_payload(
+                list(batch.reqs),
+                logits_output.hidden_states,
+                logits_output.last_hidden_states,
+                res.accept_length_per_req_cpu,
+            )
+            if all(req.finished() for req in batch.reqs):
+                self.dump_worker.get_hidden_states_for_dump()
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
@@ -1063,107 +1041,6 @@ class EAGLEWorker(TpModelWorker):
             load_format=recv_req.load_format,
         )
         return success, message
-
-    def get_hidden_states_for_dump(
-        self,
-        reqs: List[Req],
-        hidden_states: torch.Tensor,
-        last_hidden_states: torch.Tensor,
-        accept_length_per_req_cpu: List[int],
-    ):
-        with torch.cuda.stream(self.dump_stream):
-            hidden_states = hidden_states.cpu()
-            last_hidden_states = last_hidden_states.cpu()
-
-        accept_len_offset = 0
-        for i, req in enumerate(reqs):
-            if req.dump_tokens == 0:
-                if self.dump_buffer_pool:
-                    hs_buf, hs_cap, lhs_buf, lhs_cap = self.dump_buffer_pool.popleft()
-                    setattr(req, "_hs_for_dump_flat_buf", hs_buf)
-                    setattr(req, "_hs_for_dump_flat_cap", hs_cap)
-                    setattr(req, "_last_hs_for_dump_flat_buf", lhs_buf)
-                    setattr(req, "_last_hs_for_dump_flat_cap", lhs_cap)
-
-                req.append_hidden_states_for_dump(
-                    req.hidden_states_for_dump.cpu(),
-                    req.last_hidden_states_for_dump.cpu(),
-                )
-            accept_len = accept_length_per_req_cpu[i] + 1  # +1 for a bonus token
-            req.append_hidden_states_for_dump(
-                hidden_states[accept_len_offset : accept_len_offset + accept_len],
-                last_hidden_states[accept_len_offset : accept_len_offset + accept_len],
-            )
-            accept_len_offset += accept_len
-
-            self._maybe_dump_hidden_states(req)
-
-            if req.finished():
-                self.dump_buffer_pool.append(
-                    (
-                        getattr(req, "_hs_for_dump_flat_buf"),
-                        getattr(req, "_hs_for_dump_flat_cap"),
-                        getattr(req, "_last_hs_for_dump_flat_buf"),
-                        getattr(req, "_last_hs_for_dump_flat_cap"),
-                    )
-                )
-
-        assert accept_len_offset == hidden_states.shape[0]
-
-    def _maybe_dump_hidden_states(self, req: Req):
-        if not req.finished():
-            return
-
-        self.dump_worker_idx = (self.dump_worker_idx + 1) % self.tp_size
-        if self.dump_worker_idx != self.tp_rank:
-            return
-
-        assert (
-            self.server_args.hidden_states_dump_path is not None
-        ), "hidden_states_dump_path must be set"
-
-        if self.server_args.acceptance_rate_threshold < 1.0:
-            acceptance_rate = (req.spec_accepted_tokens + req.spec_verify_ct) / (
-                req.spec_verify_ct * self.server_args.speculative_num_draft_tokens
-            )
-            # Skip dump if acceptance rate is higher than threshold
-            if acceptance_rate >= self.server_args.acceptance_rate_threshold:
-                return
-
-        dump_path = os.path.join(
-            self.server_args.hidden_states_dump_path,
-            f"{req.rid}_data.ckpt",
-        )
-
-        self.save_proc_pool.submit(
-            _dump_hidden_states,
-            dump_path,
-            req.hidden_states_for_dump[: req.seqlen - 1],
-            req.last_hidden_states_for_dump[: req.seqlen - 1],
-            req.origin_input_ids,
-            req.output_ids,
-        )
-
-
-def _dump_hidden_states(
-    dump_path: str,
-    aux_hidden_states_cpu: torch.Tensor,
-    last_hidden_states_cpu: torch.Tensor,
-    origin_input_ids: List[int],
-    output_ids: List[int],
-):
-    input_ids = torch.tensor(origin_input_ids + output_ids[:-1], dtype=torch.long).view(
-        -1
-    )
-    loss_mask = torch.zeros_like(input_ids)
-    loss_mask[len(origin_input_ids) :] = 1
-    save_dict = {
-        "input_ids": input_ids,
-        "loss_mask": loss_mask,
-        "hidden_state": last_hidden_states_cpu,
-        "aux_hidden_state": aux_hidden_states_cpu,
-    }
-    torch.save(save_dict, dump_path)
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
