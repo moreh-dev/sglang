@@ -2,11 +2,11 @@ import math
 import os
 from collections import deque
 from concurrent import futures
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import List, Optional
 
 import torch
-from gguf import dataclass
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.server_args import ServerArgs
