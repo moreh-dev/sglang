@@ -213,24 +213,26 @@ class HiddenStateDumpPayload:
     accept_length_per_req_cpu: List[int]
 
 
-class DumpHiddenStateWorker:
+class HiddenStateDumper:
     def __init__(self, server_args: ServerArgs, tp_rank: int = 0, tp_size: int = 1):
         self.server_args = server_args
-        self.dump_path: str = server_args.hidden_states_dump_path
+        self.dump_path: str = server_args.speculative_eagle_hidden_states_dump_path
         self.tp_rank: int = tp_rank
         self.tp_size: int = tp_size
         self.dump_stream = torch.cuda.Stream()
-        self.buffer_pool = DumpBufferPool(available_size=256)
+        self.buffer_pool = FlatBufferPool(available_size=256)
         self.dump_executor = futures.ProcessPoolExecutor(
-            max_workers=server_args.dump_worker_num,
+            max_workers=server_args.speculative_eagle_dump_worker_num,
         )
         self.dump_worker_idx: int = -1
         self.payloads: HiddenStateDumpPayload = None
         self.dump_tokens = {}
 
-        os.makedirs(server_args.hidden_states_dump_path, exist_ok=True)
+        os.makedirs(
+            server_args.speculative_eagle_hidden_states_dump_path, exist_ok=True
+        )
 
-    def register_payload(
+    def prepare_payload(
         self,
         reqs: List[Req],
         hidden_states: torch.Tensor,
@@ -244,7 +246,7 @@ class DumpHiddenStateWorker:
             accept_length_per_req_cpu=accept_length_per_req_cpu,
         )
 
-    def get_hidden_states_for_dump(
+    def process_dump_payload(
         self,
     ):
         if self.payloads is None:
@@ -262,20 +264,20 @@ class DumpHiddenStateWorker:
         for i, req in enumerate(reqs):
             if req.rid not in self.dump_tokens:
                 self.dump_tokens[req.rid] = 0
-                self.append_hidden_states_for_dump(
+                self.append_req_hidden_states(
                     req,
                     req.hidden_states_for_dump.cpu(),
                     req.last_hidden_states_for_dump.cpu(),
                 )
             accept_len = accept_length_per_req_cpu[i] + 1  # +1 for a bonus token
-            self.append_hidden_states_for_dump(
+            self.append_req_hidden_states(
                 req,
                 hidden_states[accept_len_offset : accept_len_offset + accept_len],
                 last_hidden_states[accept_len_offset : accept_len_offset + accept_len],
             )
             accept_len_offset += accept_len
 
-            self._maybe_dump_hidden_states(req)
+            self._dump_if_needed(req)
 
             if req.finished():
                 self.buffer_pool.release_buffer(f"{req.rid}_hs")
@@ -285,7 +287,7 @@ class DumpHiddenStateWorker:
         assert accept_len_offset == hidden_states.shape[0]
         self.payloads = None
 
-    def append_hidden_states_for_dump(
+    def append_req_hidden_states(
         self, req: Req, hidden_states: torch.Tensor, last_hidden_states: torch.Tensor
     ):
         num_new_tokens = hidden_states.shape[0]
@@ -318,7 +320,7 @@ class DumpHiddenStateWorker:
         )
         self.dump_tokens[req.rid] = dump_tokens
 
-    def _maybe_dump_hidden_states(self, req: Req):
+    def _dump_if_needed(self, req: Req):
         if not req.finished():
             return
 
@@ -327,19 +329,22 @@ class DumpHiddenStateWorker:
             return
 
         assert (
-            self.server_args.hidden_states_dump_path is not None
-        ), "hidden_states_dump_path must be set"
+            self.server_args.speculative_eagle_hidden_states_dump_path is not None
+        ), "speculative_eagle_hidden_states_dump_path must be set"
 
-        if self.server_args.acceptance_rate_threshold < 1.0:
+        if self.server_args.speculative_eagle_dump_accept_rate_threshold < 1.0:
             acceptance_rate = (req.spec_accepted_tokens + req.spec_verify_ct) / (
                 req.spec_verify_ct * self.server_args.speculative_num_draft_tokens
             )
             # Skip dump if acceptance rate is higher than threshold
-            if acceptance_rate >= self.server_args.acceptance_rate_threshold:
+            if (
+                acceptance_rate
+                >= self.server_args.speculative_eagle_dump_accept_rate_threshold
+            ):
                 return
 
         dump_path = os.path.join(
-            self.server_args.hidden_states_dump_path,
+            self.server_args.speculative_eagle_hidden_states_dump_path,
             f"{req.rid}_data.ckpt",
         )
 
@@ -374,7 +379,7 @@ def dump_hidden_states(
     torch.save(save_dict, dump_path)
 
 
-class DumpBufferPool:
+class FlatBufferPool:
     def __init__(self, available_size: int = 256):
         self.pool = dict()
         self.available_buffers = deque(maxlen=available_size)

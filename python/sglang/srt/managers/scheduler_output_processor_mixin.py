@@ -159,7 +159,7 @@ class SchedulerOutputProcessorMixin:
                     # Collect hidden states for dumping as torch.Tensor
                     # These will be concatenated and saved later
                     if (
-                        self.server_args.enable_dump_hidden_states
+                        self.server_args.speculative_eagle_enable_dump_hidden_states
                         and logits_output.hidden_states is not None
                     ):
                         req.hidden_states_for_dump = logits_output.hidden_states[

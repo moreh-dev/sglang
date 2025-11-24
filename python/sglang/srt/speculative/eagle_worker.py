@@ -38,7 +38,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
-    DumpHiddenStateWorker,
+    HiddenStateDumper,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -193,12 +193,12 @@ class EAGLEWorker(TpModelWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         # Dump hidden states setup
-        if server_args.enable_dump_hidden_states:
-            assert server_args.hidden_states_dump_path is not None, (
-                "`hidden_states_dump_path` must be specified when "
-                "`enable_dump_hidden_states` is set"
+        if server_args.speculative_eagle_enable_dump_hidden_states:
+            assert server_args.speculative_eagle_hidden_states_dump_path is not None, (
+                "`speculative_eagle_hidden_states_dump_path` must be specified when "
+                "`speculative_eagle_enable_dump_hidden_states` is set"
             )
-            self.dump_worker = DumpHiddenStateWorker(
+            self.dump_worker = HiddenStateDumper(
                 server_args, tp_rank=self.tp_rank, tp_size=self.tp_size
             )
 
@@ -688,10 +688,10 @@ class EAGLEWorker(TpModelWorker):
         )
 
         if (
-            self.server_args.enable_dump_hidden_states
+            self.server_args.speculative_eagle_enable_dump_hidden_states
             and self.dump_worker.payloads is not None
         ):
-            self.dump_worker.get_hidden_states_for_dump()
+            self.dump_worker.process_dump_payload()
 
         vocab_mask = None
         if batch.has_grammar:
@@ -785,15 +785,15 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.spec_info = res.draft_input
 
-        if self.server_args.enable_dump_hidden_states:
-            self.dump_worker.register_payload(
+        if self.server_args.speculative_eagle_enable_dump_hidden_states:
+            self.dump_worker.prepare_payload(
                 list(batch.reqs),
                 logits_output.hidden_states,
                 logits_output.last_hidden_states,
                 res.accept_length_per_req_cpu,
             )
             if all(req.finished() for req in batch.reqs):
-                self.dump_worker.get_hidden_states_for_dump()
+                self.dump_worker.process_dump_payload()
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 

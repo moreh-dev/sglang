@@ -402,6 +402,12 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
 
+    # For eagle hidden states dump
+    speculative_eagle_enable_dump_hidden_states: bool = False
+    speculative_eagle_hidden_states_dump_path: Optional[str] = None
+    speculative_eagle_dump_worker_num: int = 1
+    speculative_eagle_dump_accept_rate_threshold: float = 1.0
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
@@ -524,11 +530,6 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     keep_mm_feature_on_device: bool = False
-    enable_return_hidden_states: bool = False
-    enable_dump_hidden_states: bool = False
-    hidden_states_dump_path: Optional[str] = None
-    dump_worker_num: int = 1
-    acceptance_rate_threshold: float = 1.0
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -2952,6 +2953,30 @@ class ServerArgs:
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
         )
+        # Speculative Eagle hidden states dumping
+        parser.add_argument(
+            "--speculative-eagle-enable-dump-hidden-states",
+            action="store_true",
+            help="Enable dumping hidden states generated during EAGLE speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-hidden-states-dump-path",
+            type=str,
+            default=ServerArgs.speculative_eagle_hidden_states_dump_path,
+            help="Directory path where EAGLE speculative hidden states will be dumped.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-dump-accept-rate-threshold",
+            type=float,
+            default=ServerArgs.speculative_eagle_dump_accept_rate_threshold,
+            help="Dump hidden states only when EAGLE speculative acceptance rate is below this threshold.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-dump-worker-num",
+            type=int,
+            default=ServerArgs.speculative_eagle_dump_worker_num,
+            help="Number of worker processes used for dumping hidden states.",
+        )
 
         # Expert parallelism
         parser.add_argument(
@@ -3559,29 +3584,6 @@ class ServerArgs:
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
-        )
-        parser.add_argument(
-            "--enable-dump-hidden-states",
-            action="store_true",
-            help="Enable dumping hidden states to the specified path.",
-        )
-        parser.add_argument(
-            "--hidden-states-dump-path",
-            type=str,
-            default=ServerArgs.hidden_states_dump_path,
-            help="The path to dump hidden states.",
-        )
-        parser.add_argument(
-            "--acceptance-rate-threshold",
-            type=float,
-            default=1.0,
-            help="Only dump hidden states if speculative acceptance rate < threshold.",
-        )
-        parser.add_argument(
-            "--dump-worker-num",
-            type=int,
-            default=ServerArgs.dump_worker_num,
-            help="The number of worker processes to dump hidden states.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",
