@@ -9,6 +9,7 @@ import torch
 from gguf import dataclass
 
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
@@ -210,9 +211,6 @@ class HiddenStateDumpPayload:
     hidden_states: torch.Tensor
     last_hidden_states: torch.Tensor
     accept_length_per_req_cpu: List[int]
-
-
-from sglang.srt.server_args import ServerArgs
 
 
 class DumpHiddenStateWorker:
