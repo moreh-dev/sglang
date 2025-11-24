@@ -351,8 +351,8 @@ class HiddenStateDumper:
         self.dump_executor.submit(
             dump_hidden_states,
             dump_path,
-            req.hidden_states_for_dump[: req.seqlen - 1],
             req.last_hidden_states_for_dump[: req.seqlen - 1],
+            req.hidden_states_for_dump[: req.seqlen - 1],
             req.origin_input_ids,
             req.output_ids,
         )
