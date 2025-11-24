@@ -407,6 +407,7 @@ class ServerArgs:
     speculative_eagle_hidden_states_dump_path: Optional[str] = None
     speculative_eagle_dump_worker_num: int = 1
     speculative_eagle_dump_accept_rate_threshold: float = 1.0
+    speculative_eagle_dump_buffer_pool_size: int = 64
 
     # Expert parallelism
     ep_size: int = 1
@@ -2977,6 +2978,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_eagle_dump_worker_num,
             help="Number of worker processes used for dumping hidden states.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-dump-buffer-pool-size",
+            type=int,
+            default=ServerArgs.speculative_eagle_dump_buffer_pool_size,
+            help="Size of the reusable buffer pool used for hidden-state dumping.",
         )
 
         # Expert parallelism

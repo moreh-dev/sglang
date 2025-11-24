@@ -220,7 +220,9 @@ class HiddenStateDumper:
         self.tp_rank: int = tp_rank
         self.tp_size: int = tp_size
         self.dump_stream = torch.cuda.Stream()
-        self.buffer_pool = FlatBufferPool(available_size=256)
+        self.buffer_pool = FlatBufferPool(
+            available_size=server_args.speculative_eagle_dump_buffer_pool_size
+        )
         self.dump_executor = futures.ProcessPoolExecutor(
             max_workers=server_args.speculative_eagle_dump_worker_num,
         )
