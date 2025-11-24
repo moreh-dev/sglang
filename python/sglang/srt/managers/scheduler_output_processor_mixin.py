@@ -161,6 +161,7 @@ class SchedulerOutputProcessorMixin:
                     if (
                         self.server_args.speculative_eagle_enable_dump_hidden_states
                         and logits_output.hidden_states is not None
+                        and logits_output.last_hidden_states is not None
                     ):
                         req.hidden_states_for_dump = logits_output.hidden_states[
                             slice_range
