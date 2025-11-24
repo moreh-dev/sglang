@@ -208,7 +208,7 @@ def verify_tree_greedy_func(
 @dataclass
 class HiddenStateDumpPayload:
     reqs: List[Req]
-    hidden_states: torch.Tensor
+    aux_hidden_states: torch.Tensor
     last_hidden_states: torch.Tensor
     accept_length_per_req_cpu: List[int]
 
@@ -243,7 +243,7 @@ class HiddenStateDumper:
     ):
         self.payloads = HiddenStateDumpPayload(
             reqs=reqs,
-            hidden_states=hidden_states,
+            aux_hidden_states=hidden_states,
             last_hidden_states=last_hidden_states,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
         )
@@ -255,11 +255,11 @@ class HiddenStateDumper:
             return
 
         reqs = self.payloads.reqs
-        hidden_states = self.payloads.hidden_states
+        aux_hidden_states = self.payloads.aux_hidden_states
         last_hidden_states = self.payloads.last_hidden_states
         accept_length_per_req_cpu = self.payloads.accept_length_per_req_cpu
         with torch.cuda.stream(self.dump_stream):
-            hidden_states = hidden_states.cpu()
+            aux_hidden_states = aux_hidden_states.cpu()
             last_hidden_states = last_hidden_states.cpu()
 
         accept_len_offset = 0
@@ -274,7 +274,7 @@ class HiddenStateDumper:
             accept_len = accept_length_per_req_cpu[i] + 1  # +1 for a bonus token
             self.append_req_hidden_states(
                 req,
-                hidden_states[accept_len_offset : accept_len_offset + accept_len],
+                aux_hidden_states[accept_len_offset : accept_len_offset + accept_len],
                 last_hidden_states[accept_len_offset : accept_len_offset + accept_len],
             )
             accept_len_offset += accept_len
@@ -286,25 +286,28 @@ class HiddenStateDumper:
                 self.buffer_pool.release_buffer(f"{req.rid}_lhs")
                 self.dump_tokens.pop(req.rid)
 
-        assert accept_len_offset == hidden_states.shape[0]
+        assert accept_len_offset == aux_hidden_states.shape[0]
         self.payloads = None
 
     def append_req_hidden_states(
-        self, req: Req, hidden_states: torch.Tensor, last_hidden_states: torch.Tensor
+        self,
+        req: Req,
+        aux_hidden_states: torch.Tensor,
+        last_hidden_states: torch.Tensor,
     ):
-        num_new_tokens = hidden_states.shape[0]
-        H = hidden_states.shape[1]
+        num_new_tokens = aux_hidden_states.shape[0]
+        H = aux_hidden_states.shape[1]
         H_last = last_hidden_states.shape[1]
         dump_tokens = self.dump_tokens[req.rid]
 
         hs_buf = self.buffer_pool.get_buffer(
             f"{req.rid}_hs",
-            hidden_states.device,
-            hidden_states.dtype,
-            dump_tokens * H + hidden_states.numel(),
+            aux_hidden_states.device,
+            aux_hidden_states.dtype,
+            dump_tokens * H + aux_hidden_states.numel(),
         )
         hs_buf[dump_tokens * H : (dump_tokens + num_new_tokens) * H] = (
-            hidden_states.view(-1)
+            aux_hidden_states.view(-1)
         )
         lhs_buf = self.buffer_pool.get_buffer(
             f"{req.rid}_lhs",
@@ -407,7 +410,7 @@ class FlatBufferPool:
         dtype: torch.dtype,
         needed_elems: int,
         growth: float = 2.0,
-        min_elem: int = 32 * 1024 * 1024,
+        min_elem: int = 2 * 1024 * 1024,
     ):
         """
         Reusable expandable flat buffer (1D). Grows geometrically.
