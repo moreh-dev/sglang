@@ -260,7 +260,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         else:
             self.cp_size = None
         # ROCm-only: split the prefill indexer's logits + top-k across attn-TP
-        # ranks (port of vllm-moreh indexer_m_split). See _get_topk_ragged_m_split.
+        # ranks. See _get_topk_ragged_m_split.
         self.dsa_indexer_m_split = _is_hip and envs.SGLANG_DSA_INDEXER_M_SPLIT.get()
         self.dsa_indexer_m_split_stripe = max(
             1, envs.SGLANG_DSA_INDEXER_M_SPLIT_STRIPE.get()
