@@ -1460,7 +1460,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         cached = self._m_split_budget_bytes.get(device_index)
         if cached is not None:
             return cached
-        local_budget = self._get_mqa_logits_budget_bytes(device_index)
+        # Same cap as _should_chunk_mqa_logits: aiter's fp8_mqa_logits only
+        # compiles below 2 GiB of logits (buffer_store), regardless of free memory.
+        local_budget = min(
+            self._get_mqa_logits_budget_bytes(device_index),
+            self._MQA_LOGITS_MAX_BYTES_ROCM,
+        )
         budget = torch.tensor(
             [local_budget], dtype=torch.int64, device=f"cuda:{device_index}"
         )
