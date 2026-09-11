@@ -212,6 +212,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     # aiter's fp8_mqa_logits only compiles below 2 GiB of logits (buffer_store).
     _MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
     _mqa_logits_budget_bytes: Dict[int, int] = {}
+    # Attn-TP-wide MIN of the budget above; M-split derives row ownership
+    # from it, so every rank must see the same value.
+    _m_split_budget_bytes: Dict[int, int] = {}
 
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
@@ -1202,8 +1205,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_result=topk_result,
                 q_offset=q_offset,
                 k_offset=k_offset,
-                need_chunk=need_chunk,
-                logits_budget_bytes=logits_budget_bytes,
             )
             # None: nothing to split (single rank / too few rows), use the
             # replicated paths below.
@@ -1359,8 +1360,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         topk_result: torch.Tensor,
         q_offset: int,
         k_offset: int,
-        need_chunk: bool,
-        logits_budget_bytes: int,
     ) -> Optional[torch.Tensor]:
         """M-split prefill indexer (ROCm): each attn-TP rank scores an interleaved
         stripe subset of the query rows, writes its top-k into a -1-filled
@@ -1388,13 +1387,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         kv, scale = kv_fp8
         device = q_fp8.device
 
-        stripe = max(1, min(self.dsa_indexer_m_split_stripe, q_offset // tp_size))
-        if need_chunk:
-            # Every stripe must stay under the logits budget (aiter's 2 GiB
-            # buffer_store limit on ROCm), same bound as the chunked path.
-            bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
-            max_rows = max(1, int(logits_budget_bytes // max(bytes_per_row, 1)))
-            stripe = min(stripe, max_rows)
+        # Every stripe must stay under the logits budget (aiter's 2 GiB
+        # buffer_store limit on ROCm). The per-rank budget depends on each GPU's
+        # free memory, and a different stripe per rank would leave rows that no
+        # rank owns at -1, so the budget is the attn-TP-wide MIN.
+        budget_bytes = self._get_m_split_logits_budget_bytes(tp_group, device.index)
+        bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM
+        max_rows = max(1, budget_bytes // max(bytes_per_row, 1))
+        stripe = max(
+            1, min(self.dsa_indexer_m_split_stripe, q_offset // tp_size, max_rows)
+        )
         block = tp_size * stripe
 
         # Same per-row-range top-k contract as the chunked path: RAGGED uses the
@@ -1453,6 +1455,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         self._m_split_all_reduce_max(tp_group, topk_result[:q_offset])
         return topk_result
+
+    def _get_m_split_logits_budget_bytes(self, tp_group, device_index: int) -> int:
+        cached = self._m_split_budget_bytes.get(device_index)
+        if cached is not None:
+            return cached
+        local_budget = self._get_mqa_logits_budget_bytes(device_index)
+        budget = torch.tensor(
+            [local_budget], dtype=torch.int64, device=f"cuda:{device_index}"
+        )
+        dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=tp_group.device_group)
+        synced = max(1, int(budget.item()))
+        # Under capture the local budget is the static estimate and is not
+        # cached either; cache only the real free-memory value.
+        if not get_is_capture_mode():
+            self._m_split_budget_bytes[device_index] = synced
+        return synced
 
     @staticmethod
     def _m_split_all_reduce_max(tp_group, buf: torch.Tensor) -> None:
