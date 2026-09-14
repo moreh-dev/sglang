@@ -1533,7 +1533,7 @@ class Envs:
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     # ROCm only: split the prefill indexer's logits + top-k across attn-TP
     # ranks in interleaved row stripes and AllReduce(MAX) the -1-filled
-    # result. Port of vllm-moreh ops/indexer_m_split.py.
+    # result.
     SGLANG_DSA_INDEXER_M_SPLIT = EnvBool(False)
     SGLANG_DSA_INDEXER_M_SPLIT_STRIPE = EnvInt(512)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
