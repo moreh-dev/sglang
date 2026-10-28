@@ -2030,6 +2030,11 @@ class Envs:
     # ROCm gfx950: compute the k-pool indexer's prefill (ragged) logits with the
     # in-tree HIP fp8_mqa_logits kernel instead of aiter's Triton one.
     SGLANG_DSA_HIP_FP8_MQA_LOGITS = EnvBool(False)
+    # ROCm gfx950: compute the k-pool indexer's decode (paged) logits with the
+    # in-tree HIP fp8_paged_mqa_logits kernel instead of aiter's Triton one,
+    # for decode batches of at least SGLANG_DSA_HIP_FP8_PAGED_MQA_LOGITS_MIN_ROWS rows.
+    SGLANG_DSA_HIP_FP8_PAGED_MQA_LOGITS = EnvBool(False)
+    SGLANG_DSA_HIP_FP8_PAGED_MQA_LOGITS_MIN_ROWS = EnvInt(16)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)

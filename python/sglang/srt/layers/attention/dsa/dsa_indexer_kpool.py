@@ -1089,17 +1089,32 @@ class IndexerKPool(MultiPlatformOp):
                     "artifacts present in the image."
                 )
             from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
-
-            logits = aiter_paged_mqa_logits(
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                pool_seqlens,
-                pool_block_tables,
-                pool_max_seq_len,
-                preshuffle=True,
-                kv_block_size=block_kv,
+            from sglang.srt.layers.attention.dsa.hip_indexer_logits import (
+                hip_fp8_paged_mqa_logits,
+                hip_fp8_paged_mqa_logits_enabled,
             )
+
+            logits = None
+            if hip_fp8_paged_mqa_logits_enabled():
+                logits = hip_fp8_paged_mqa_logits(
+                    q_fp8=q_fp8,
+                    kv_cache_fp8=kv_cache_fp8,
+                    weights=weights,
+                    seq_lens=pool_seqlens,
+                    block_tables=pool_block_tables,
+                    max_seq_len=pool_max_seq_len,
+                )
+            if logits is None:
+                logits = aiter_paged_mqa_logits(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    pool_seqlens,
+                    pool_block_tables,
+                    pool_max_seq_len,
+                    preshuffle=True,
+                    kv_block_size=block_kv,
+                )
         elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,
