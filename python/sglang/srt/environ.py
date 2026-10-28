@@ -2027,6 +2027,9 @@ class Envs:
     # kernels (kernels/jit/csrc/dsa_gfx950/kpool_compress.cuh) instead of the
     # Triton writers; byte-identical cache and tail ring.
     SGLANG_DSA_KPOOL_HIP_COMPRESS = EnvBool(False)
+    # ROCm gfx950: compute the k-pool indexer's prefill (ragged) logits with the
+    # in-tree HIP fp8_mqa_logits kernel instead of aiter's Triton one.
+    SGLANG_DSA_HIP_FP8_MQA_LOGITS = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)

@@ -945,8 +945,26 @@ class IndexerKPool(MultiPlatformOp):
         *,
         clean_logits: bool,
     ) -> torch.Tensor:
-        """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
+        """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm,
+        or the in-tree HIP kernel behind SGLANG_DSA_HIP_FP8_MQA_LOGITS."""
         if is_hip():
+            from sglang.srt.layers.attention.dsa.hip_indexer_logits import (
+                hip_fp8_mqa_logits,
+                hip_fp8_mqa_logits_enabled,
+            )
+
+            if hip_fp8_mqa_logits_enabled():
+                logits = hip_fp8_mqa_logits(
+                    q_fp8=q_fp8,
+                    k_fp8=k_fp8,
+                    k_scale=k_scale,
+                    weights=weights,
+                    starts=starts,
+                    ends=ends,
+                    clean_logits=clean_logits,
+                )
+                if logits is not None:
+                    return logits
             from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
             # above 2 GiB of fp32 logits the kernel miscompiles and abort()s the
