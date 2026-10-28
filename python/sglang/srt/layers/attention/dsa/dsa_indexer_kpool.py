@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.kpool_hip_compress import (
+    kpool_hip_compress_enabled,
+)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -471,21 +474,40 @@ class IndexerKPool(MultiPlatformOp):
                         )
             if not writes.is_empty:
                 buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-                kpool_assemble_softmax_rotate_write_cache(
-                    pool=pool,
-                    buf=buf,
-                    chunk_k=key,
-                    chunk_score=gate_score,
-                    tail_k=tail_k_buf,
-                    tail_score=tail_score_buf,
-                    req_pool_idx=writes.req,
-                    n_from_tail=writes.n_from_tail,
-                    chunk_src_start=writes.chunk_src,
-                    tail_logical_base=writes.tail_logical_base,
-                    ape=self.index_kpool_compress_ape,
-                    loc=writes.write_loc,
-                    round_scale=self.scale_fmt is not None,
-                )
+                use_hip = kpool_hip_compress_enabled()
+                if use_hip:
+                    from sglang.srt.layers.attention.dsa.kpool_hip_compress import (
+                        hip_kpool_insert_from_plan,
+                    )
+
+                    hip_kpool_insert_from_plan(
+                        pool=pool,
+                        buf=buf,
+                        chunk_k=key,
+                        chunk_score=gate_score,
+                        chunk_src=writes.chunk_src,
+                        n_from_tail=writes.n_from_tail,
+                        write_loc=writes.write_loc,
+                        ape=self.index_kpool_compress_ape,
+                        round_scale=self.scale_fmt is not None,
+                    )
+                if not use_hip or plan.any_from_tail:
+                    kpool_assemble_softmax_rotate_write_cache(
+                        pool=pool,
+                        buf=buf,
+                        chunk_k=key,
+                        chunk_score=gate_score,
+                        tail_k=tail_k_buf,
+                        tail_score=tail_score_buf,
+                        req_pool_idx=writes.req,
+                        n_from_tail=writes.n_from_tail,
+                        chunk_src_start=writes.chunk_src,
+                        tail_logical_base=writes.tail_logical_base,
+                        ape=self.index_kpool_compress_ape,
+                        loc=writes.write_loc,
+                        write_mask=(writes.n_from_tail > 0) if use_hip else None,
+                        round_scale=self.scale_fmt is not None,
+                    )
 
             if not tails.is_empty:
                 scatter_kpool_tail_updates(

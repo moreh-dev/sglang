@@ -101,6 +101,8 @@ class KPoolExtendPlan:
     ragged_paged_page_table: Optional[torch.Tensor]
     ragged_paged_page_table_row_index: Optional[torch.Tensor]
     cp: Optional[KPoolCpInfo] = None
+    # True when some pool of this extend starts in a request's tail ring.
+    any_from_tail: bool = False
 
 
 @dataclass(frozen=True)
@@ -456,6 +458,7 @@ def _kpool_plan_to_gpu(
         ragged_paged_page_table=ragged_paged_page_table,
         ragged_paged_page_table_row_index=ragged_paged_page_table_row_index,
         cp=_kpool_cp_owner_rank(forward_batch, n_pool, device),
+        any_from_tail=any(n > 0 for n in cpu.pool_n_from_tail),
     )
 
 

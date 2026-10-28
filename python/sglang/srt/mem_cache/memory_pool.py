@@ -58,6 +58,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.kpool_hip_compress import (
+    kpool_hip_compress_enabled,
+    kpool_hip_tail_ring,
+)
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -5441,6 +5445,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         """Keep request tails on the pool so they follow the index-cache lifecycle."""
         self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
 
+        self._compress_tail_kv: Optional[List[torch.Tensor]] = None
+        self.kpool_hip_compress = False
         if not self.kpool_use_compress:
             self._compress_tail_k = None
             self._compress_tail_score = None
@@ -5454,6 +5460,31 @@ class DSATokenToKVPool(MLATokenToKVPool):
         req_pool_size = max_running_requests + 1
         tail_dtype = torch.bfloat16
         tail_width = index_kpool + tail_extra_slots
+        self.kpool_hip_compress = kpool_hip_compress_enabled()
+        if self.kpool_hip_compress:
+            # The HIP decode kernel reads K and gate from one [req, 2, ring, 128]
+            # tensor; the Triton writers take the two strided views through their
+            # strides.
+            tail_width = kpool_hip_tail_ring(index_kpool, tail_extra_slots)
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self._compress_tail_kv = [
+                    torch.zeros(
+                        req_pool_size if self._should_allocate_index_layer(i) else 0,
+                        2,
+                        tail_width,
+                        index_head_dim,
+                        dtype=tail_dtype,
+                        device=device,
+                    )
+                    for i in range(layer_num)
+                ]
+            self._compress_tail_k = [kv[:, 0] for kv in self._compress_tail_kv]
+            self._compress_tail_score = [kv[:, 1] for kv in self._compress_tail_kv]
+            return
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -5528,6 +5559,26 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         idx = layer_id - self.start_layer
         buf = self.get_index_k_with_scale_buffer(layer_id)
+        if self.kpool_hip_compress:
+            from sglang.srt.layers.attention.dsa.kpool_hip_compress import (
+                hip_kpool_decode_update,
+            )
+
+            hip_kpool_decode_update(
+                pool=self,
+                buf=buf,
+                tail_kv=self._compress_tail_kv[idx],
+                key=key,
+                slot_score=slot_score,
+                ape=ape,
+                block_tables=block_tables,
+                req_pool_indices=req_pool_indices,
+                positions=positions,
+                seq_lens=seq_lens,
+                out_cache_loc=out_cache_loc,
+                round_scale=round_scale,
+            )
+            return
         kpool_decode_update_and_maybe_write_cache(
             pool=self,
             buf=buf,
@@ -5572,6 +5623,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if hasattr(self, "_compress_tail_k") and self._compress_tail_k is not None:
             del self._compress_tail_k
             del self._compress_tail_score
+            self._compress_tail_kv = None
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""

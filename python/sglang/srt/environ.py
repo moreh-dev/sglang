@@ -2023,6 +2023,10 @@ class Envs:
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
+    # ROCm gfx950: write the pooled index cache with the in-tree HIP kpool
+    # kernels (kernels/jit/csrc/dsa_gfx950/kpool_compress.cuh) instead of the
+    # Triton writers; byte-identical cache and tail ring.
+    SGLANG_DSA_KPOOL_HIP_COMPRESS = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)

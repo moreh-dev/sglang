@@ -1042,8 +1042,8 @@ def kpool_decode_update_and_maybe_write_cache(
     assert buf.dtype == torch.uint8
     assert pool.index_page_size == BLOCK_SIZE_K
     assert pool.index_head_dim == INDEX_HEAD_DIM
-    assert tail_k.is_contiguous()
-    assert tail_score.is_contiguous()
+    assert tail_k.stride(2) == 1 and tail_k.stride(1) == tail_k.shape[2]
+    assert tail_score.stride(2) == 1 and tail_score.stride(1) == tail_score.shape[2]
 
     batch = key.shape[0]
     if batch == 0:
