@@ -3446,6 +3446,21 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+        from sglang.srt.layers.attention.dsa.hip_sparse_mla import (
+            hip_sparse_mla_fp8_enabled,
+            hip_sparse_mla_fp8_fwd,
+        )
+
+        if hip_sparse_mla_fp8_enabled():
+            out = hip_sparse_mla_fp8_fwd(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=sm_scale,
+                v_head_dim=v_head_dim,
+            )
+            if out is not None:
+                return out
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,

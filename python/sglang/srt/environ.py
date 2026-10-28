@@ -2035,6 +2035,10 @@ class Envs:
     # for decode batches of at least SGLANG_DSA_HIP_FP8_PAGED_MQA_LOGITS_MIN_ROWS rows.
     SGLANG_DSA_HIP_FP8_PAGED_MQA_LOGITS = EnvBool(False)
     SGLANG_DSA_HIP_FP8_PAGED_MQA_LOGITS_MIN_ROWS = EnvInt(16)
+    # ROCm gfx950: run the sparse MLA attention core (tilelang DSA backend) with
+    # the in-tree HIP FP8 kernel: BF16 q converted in the kernel, FP8 latent KV,
+    # BF16 out. Needs 64 query heads per rank (attention DP) and an fp8 KV cache.
+    SGLANG_DSA_HIP_SPARSE_MLA_FP8 = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
