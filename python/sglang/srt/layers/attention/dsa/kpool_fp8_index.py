@@ -854,6 +854,51 @@ def topk_from_pooled_history_logits(
     )
 
 
+def topk_from_pooled_groups(
+    groups: torch.Tensor,
+    group_lengths: torch.Tensor,
+    kpool: int,
+    topk: int,
+    page_table: torch.Tensor | None = None,
+    topk_offsets: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    out_rows: int | None = None,
+    page_table_row_index: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``topk_from_pooled_history_logits`` for pools a fused logits + top-k
+    kernel already ranked: ``groups[r]`` holds row r's ``topk // kpool`` pool
+    ids, relative to its row start."""
+    assert groups.ndim == 2
+    assert group_lengths.ndim == 1
+    assert groups.shape[0] == group_lengths.shape[0]
+    assert out_rows is None or out_rows >= groups.shape[0]
+    if topk_offsets is not None and topk_offsets.ndim == 2:
+        assert topk_offsets.shape[1] == 1
+        topk_offsets = topk_offsets.squeeze(1)
+
+    from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
+        kpool_transform_selected_groups,
+    )
+
+    result = kpool_transform_selected_groups(
+        groups=groups,
+        lengths=group_lengths.to(torch.int32),
+        kpool=kpool,
+        topk=topk,
+        page_table=page_table,
+        topk_indices_offset=topk_offsets,
+        seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
+        page_table_row_index=page_table_row_index,
+    )
+    if out_rows is None or out_rows == result.shape[0]:
+        return result
+    padded = torch.full(
+        (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
+    )
+    padded[: result.shape[0]] = result
+    return padded
+
+
 def _kpool_topk_unfused(
     *,
     logits: torch.Tensor,
