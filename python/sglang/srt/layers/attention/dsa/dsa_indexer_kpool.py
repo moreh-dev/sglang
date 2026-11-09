@@ -90,6 +90,28 @@ def _slice_rows(
     return None if tensor is None else tensor[rows]
 
 
+def _trim_topk_mapping_rows(
+    *,
+    n_rows: int,
+    page_table: Optional[torch.Tensor],
+    topk_offsets: Optional[torch.Tensor],
+    page_table_row_index: Optional[torch.Tensor],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """The top-k mapping inputs cut to the first n_rows rows; a page table
+    addressed through page_table_row_index keeps all of its rows."""
+    if (
+        page_table is not None
+        and page_table_row_index is None
+        and page_table.shape[0] != n_rows
+    ):
+        page_table = page_table[:n_rows]
+    if topk_offsets is not None and topk_offsets.shape[0] != n_rows:
+        topk_offsets = topk_offsets[:n_rows]
+    if page_table_row_index is not None and page_table_row_index.shape[0] != n_rows:
+        page_table_row_index = page_table_row_index[:n_rows]
+    return page_table, topk_offsets, page_table_row_index
+
+
 def _mqa_logits_row_chunks(
     *, num_rows: int, num_cols: int, device: torch.device
 ) -> Tuple[slice, ...]:
@@ -778,18 +800,12 @@ class IndexerKPool(MultiPlatformOp):
             topk_from_pooled_history_logits,
         )
 
-        n_rows = logits.shape[0]
-        if (
-            page_table is not None
-            and page_table_row_index is None
-            and page_table.shape[0] != n_rows
-        ):
-            page_table = page_table[:n_rows]
-        if topk_offsets is not None and topk_offsets.shape[0] != n_rows:
-            topk_offsets = topk_offsets[:n_rows]
-        if page_table_row_index is not None and page_table_row_index.shape[0] != n_rows:
-            page_table_row_index = page_table_row_index[:n_rows]
-
+        page_table, topk_offsets, page_table_row_index = _trim_topk_mapping_rows(
+            n_rows=logits.shape[0],
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+            page_table_row_index=page_table_row_index,
+        )
         return topk_from_pooled_history_logits(
             logits=logits,
             group_lengths=pool_lens,
@@ -802,6 +818,68 @@ class IndexerKPool(MultiPlatformOp):
             out_rows=out_rows,
             page_table_row_index=page_table_row_index,
             topk_v2_plan=topk_v2_plan,
+        )
+
+    def _fused_mqa_topk_groups(
+        self,
+        *,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_fp8: Tuple[torch.Tensor, torch.Tensor],
+        starts: torch.Tensor,
+        ends: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Each row's top pool ids from the in-tree HIP logits + top-k kernel behind
+        SGLANG_DSA_HIP_FP8_MQA_TOPK, or None where it does not apply and
+        the caller computes logits."""
+        from sglang.srt.layers.attention.dsa.hip_indexer_topk import (
+            hip_fp8_mqa_topk,
+            hip_fp8_mqa_topk_enabled,
+        )
+
+        if not hip_fp8_mqa_topk_enabled():
+            return None
+        k_fp8, k_scale = kv_fp8
+        return hip_fp8_mqa_topk(
+            q_fp8=q_fp8,
+            k_fp8=k_fp8,
+            k_scale=k_scale,
+            weights=weights,
+            starts=starts,
+            ends=ends,
+            topk=self.index_topk // self.index_kpool,
+        )
+
+    def _topk_from_kpool_groups(
+        self,
+        groups: torch.Tensor,
+        pool_lens: torch.Tensor,
+        seq_lens: Optional[torch.Tensor] = None,
+        page_table: Optional[torch.Tensor] = None,
+        topk_offsets: Optional[torch.Tensor] = None,
+        out_rows: Optional[int] = None,
+        page_table_row_index: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            topk_from_pooled_groups,
+        )
+
+        page_table, topk_offsets, page_table_row_index = _trim_topk_mapping_rows(
+            n_rows=groups.shape[0],
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+            page_table_row_index=page_table_row_index,
+        )
+        return topk_from_pooled_groups(
+            groups=groups,
+            group_lengths=pool_lens,
+            kpool=self.index_kpool,
+            topk=self.index_topk,
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+            seq_lens=seq_lens,
+            out_rows=out_rows,
+            page_table_row_index=page_table_row_index,
         )
 
     def _get_kpool_decode_metadata(
@@ -1122,47 +1200,74 @@ class IndexerKPool(MultiPlatformOp):
         single_chunk = len(row_chunks) == 1
         topk_result = None
         for rows in row_chunks:
-            if kv_fp8 is None:
-                # No pooled keys yet: every row scores an empty key set.
-                logits = torch.empty(
-                    (rows.stop - rows.start, 0),
-                    dtype=torch.float32,
-                    device=q_fp8.device,
-                )
-            else:
+            # Addressed by request-pool ID through page_table_row_index, so never
+            # sliced; without a row index it is per-query.
+            chunk_page_table = (
+                page_table
+                if page_table_row_index is not None
+                else _slice_rows(tensor=page_table, rows=rows)
+            )
+            groups = None
+            if kv_fp8 is not None:
                 assert logits_starts is not None
-                k_fp8, k_scale = kv_fp8
-                logits = self._fp8_mqa_logits(
+                groups = self._fused_mqa_topk_groups(
                     q_fp8=q_fp8[rows].contiguous(),
-                    k_fp8=k_fp8,
-                    k_scale=k_scale,
                     weights=weights[rows].contiguous(),
+                    kv_fp8=kv_fp8,
                     starts=logits_starts[rows],
                     ends=logits_ends[rows],
-                    clean_logits=True,
                 )
-            topk_chunk = self._topk_from_kpool_logits(
-                logits=logits,
-                pool_lens=pool_lens[rows],
-                seq_lens=_slice_rows(tensor=seq_lens, rows=rows),
-                # Addressed by request-pool ID through page_table_row_index,
-                # so never sliced; without a row index it is per-query.
-                page_table=(
-                    page_table
-                    if page_table_row_index is not None
-                    else _slice_rows(tensor=page_table, rows=rows)
-                ),
-                topk_offsets=_slice_rows(tensor=topk_offsets, rows=rows),
-                row_starts=_slice_rows(tensor=topk_row_starts, rows=rows),
-                out_rows=out_rows if single_chunk else None,
-                page_table_row_index=_slice_rows(
-                    tensor=page_table_row_index, rows=rows
-                ),
-            )
-            if single_chunk:
-                return topk_chunk
-            # Free this chunk's logits before the next one allocates.
-            del logits
+            if groups is not None:
+                # The fused scan ranked the pools; no logits exist for this chunk.
+                topk_chunk = self._topk_from_kpool_groups(
+                    groups=groups,
+                    pool_lens=pool_lens[rows],
+                    seq_lens=_slice_rows(tensor=seq_lens, rows=rows),
+                    page_table=chunk_page_table,
+                    topk_offsets=_slice_rows(tensor=topk_offsets, rows=rows),
+                    out_rows=out_rows if single_chunk else None,
+                    page_table_row_index=_slice_rows(
+                        tensor=page_table_row_index, rows=rows
+                    ),
+                )
+                if single_chunk:
+                    return topk_chunk
+                del groups
+            else:
+                if kv_fp8 is None:
+                    # No pooled keys yet: every row scores an empty key set.
+                    logits = torch.empty(
+                        (rows.stop - rows.start, 0),
+                        dtype=torch.float32,
+                        device=q_fp8.device,
+                    )
+                else:
+                    k_fp8, k_scale = kv_fp8
+                    logits = self._fp8_mqa_logits(
+                        q_fp8=q_fp8[rows].contiguous(),
+                        k_fp8=k_fp8,
+                        k_scale=k_scale,
+                        weights=weights[rows].contiguous(),
+                        starts=logits_starts[rows],
+                        ends=logits_ends[rows],
+                        clean_logits=True,
+                    )
+                topk_chunk = self._topk_from_kpool_logits(
+                    logits=logits,
+                    pool_lens=pool_lens[rows],
+                    seq_lens=_slice_rows(tensor=seq_lens, rows=rows),
+                    page_table=chunk_page_table,
+                    topk_offsets=_slice_rows(tensor=topk_offsets, rows=rows),
+                    row_starts=_slice_rows(tensor=topk_row_starts, rows=rows),
+                    out_rows=out_rows if single_chunk else None,
+                    page_table_row_index=_slice_rows(
+                        tensor=page_table_row_index, rows=rows
+                    ),
+                )
+                if single_chunk:
+                    return topk_chunk
+                # Free this chunk's logits before the next one allocates.
+                del logits
             if topk_result is None:
                 # Rows past the last chunk are padding, matching out_rows.
                 num_out_rows = row_chunks[-1].stop if out_rows is None else out_rows

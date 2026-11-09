@@ -54,13 +54,16 @@ repos:
         args: ['--config', '.codespellrc']
         # Vendored ROCm/aiter#5882 kernel, kept byte-for-byte (`padd` is a helper name).
         # TODO(aiter#5882): remove once ROCm/aiter#5882 is in the aiter pin
-        exclude: ^python/sglang/kernels/ops/attention/dsv4/flydsl_v4nm/
+        # Vendored moreh-dev/rocm-aiter fp8_mqa_topk kernels, kept byte-for-byte (`offen` is an ISA operand).
+        exclude: ^python/sglang/kernels/(ops/attention/dsv4/flydsl_v4nm|jit/csrc/dsa_gfx950/fp8_mqa_topk)/
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v20.1.7
     hooks:
     - id: clang-format
       types_or: [c++, cuda]
       args: [--style=file, --verbose]
+      # Vendored kernels kept byte-for-byte: their hand-placed waits were checked on this text's ISA.
+      exclude: ^python/sglang/kernels/jit/csrc/dsa_gfx950/fp8_mqa_topk/
   - repo: https://github.com/kynan/nbstripout
     rev: 0.9.0
     hooks:
