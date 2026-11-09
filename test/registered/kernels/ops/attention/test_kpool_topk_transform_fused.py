@@ -22,6 +22,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
     fast_kpool_topk_transform_fused,
+    kpool_transform_selected_groups,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -231,6 +232,70 @@ def test_graph_replay_short_rows_page_mapping_and_tail(long_length):
             atol=0,
             rtol=0,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a GPU")
+@pytest.mark.parametrize("mapping", ["raw", "page_table_row_index", "topk_offsets"])
+def test_selected_groups_transform_matches_radix_path(mapping):
+    """The fused gfx950 indexer ranks pools itself and hands them to
+    ``kpool_transform_selected_groups``; given the radix path's own selection it
+    must write the same rows: pooled token set, tail, mapping and -1 padding.
+    Rows of at most ``group_topk`` pools must not read their groups row."""
+    torch.manual_seed(7)
+    kpool, topk = 4, 2048
+    group_topk = topk // kpool
+    lengths_host = [0, 3, group_topk, group_topk + 1, 3000]
+    tails_host = [1, 2, 3, 0, 2]
+    rows, start = len(lengths_host), 37
+    width = start + max(lengths_host) + 5
+    scores = torch.stack(
+        [torch.randperm(width, dtype=torch.float32) for _ in range(rows)]
+    ).cuda()
+    lengths = torch.tensor(lengths_host, dtype=torch.int32, device="cuda")
+    seq_lens = lengths * kpool + torch.tensor(
+        tails_host, dtype=torch.int32, device="cuda"
+    )
+    # -7 would surface as negative tokens if a short row read its groups row.
+    groups = torch.full((rows, group_topk), -7, dtype=torch.int32, device="cuda")
+    for row, length in enumerate(lengths_host):
+        if length > group_topk:
+            ranked = scores[row, start : start + length].topk(group_topk).indices
+            groups[row] = ranked.flip(0).to(torch.int32)
+
+    mapping_args = {}
+    if mapping == "page_table_row_index":
+        page_rows, page_width = rows + 2, width * kpool
+        mapping_args["page_table"] = torch.arange(
+            page_rows * page_width, dtype=torch.int32, device="cuda"
+        ).reshape(page_rows, page_width)
+        mapping_args["page_table_row_index"] = torch.tensor(
+            [5, 0, 3, 1, 6], dtype=torch.int32, device="cuda"
+        )
+    elif mapping == "topk_offsets":
+        mapping_args["topk_indices_offset"] = torch.tensor(
+            [0, 100, 20000, 7, 1 << 20], dtype=torch.int32, device="cuda"
+        )
+
+    expected = fast_kpool_topk_transform_fused(
+        scores,
+        lengths,
+        kpool,
+        topk,
+        row_starts=torch.full_like(lengths, start),
+        seq_lens=seq_lens,
+        **mapping_args,
+    )
+    got = kpool_transform_selected_groups(
+        groups, lengths, kpool, topk, seq_lens=seq_lens, **mapping_args
+    )
+    # Pooled columns are an unordered set; tail and padding columns are positional.
+    torch.testing.assert_close(
+        got[:, :topk].sort(dim=1).values,
+        expected[:, :topk].sort(dim=1).values,
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(got[:, topk:], expected[:, topk:], atol=0, rtol=0)
 
 
 if __name__ == "__main__":
