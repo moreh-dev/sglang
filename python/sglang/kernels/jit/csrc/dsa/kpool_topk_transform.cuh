@@ -354,6 +354,55 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
   }
 }
 
+inline constexpr int kGroupsThreadsPerBlock = 256;
+
+// kpool_topk_transform_kernel's output contract with the pool ranking done by
+// the caller: a row longer than K pools reads its K selected pool ids (relative
+// to its row start, in any order) from `groups`; a shorter row ignores them and
+// takes every pool in order, as the radix path does.
+template <int K>
+__global__ __launch_bounds__(kGroupsThreadsPerBlock) void kpool_groups_transform_kernel(
+    const int32_t* __restrict__ groups,
+    const int64_t groups_stride,
+    const int32_t* __restrict__ lengths,
+    int32_t* __restrict__ dst_token_indices,
+    const int64_t dst_stride,
+    const int32_t pool_size,
+    const int32_t token_topk,
+    const int32_t out_cols,
+    const int32_t* __restrict__ page_table,
+    const int64_t page_table_stride,
+    const int32_t* __restrict__ page_table_row_index,
+    const int32_t* __restrict__ topk_indices_offset,
+    const int32_t* __restrict__ seq_lens) {
+  const auto bid = static_cast<uint64_t>(blockIdx.x);
+  const auto length = lengths[bid];
+  const auto row_groups = groups + bid * groups_stride;
+  const auto dst = dst_token_indices + bid * dst_stride;
+  const auto page_table_row = page_table_row_index == nullptr ? bid : static_cast<uint64_t>(page_table_row_index[bid]);
+  const auto page_table_entry = page_table == nullptr ? nullptr : page_table + page_table_row * page_table_stride;
+  const auto offset = topk_indices_offset == nullptr ? 0 : topk_indices_offset[bid];
+  const bool append_tail = seq_lens != nullptr;
+  const auto full_pool_token_len = length * pool_size;
+  const auto history_len = full_pool_token_len < token_topk ? full_pool_token_len : token_topk;
+  const auto tail_count = append_tail ? seq_lens[bid] % pool_size : 0;
+  const bool ranked = length > K;
+
+  for (int col = threadIdx.x; col < out_cols; col += kGroupsThreadsPerBlock) {
+    if (col < history_len) {
+      const auto group_rank = col / pool_size;
+      const auto group_id = ranked ? row_groups[group_rank] : group_rank;
+      const auto raw_token = group_id * pool_size + col % pool_size;
+      dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
+    } else if (append_tail && col < history_len + tail_count) {
+      const auto raw_token = length * pool_size + (col - history_len);
+      dst[col] = transform_kpool_token(raw_token, page_table_entry, topk_indices_offset, offset);
+    } else {
+      dst[col] = -1;
+    }
+  }
+}
+
 template <typename T>
 const T* optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& opt) {
   if (!opt.has_value()) {
@@ -364,27 +413,28 @@ const T* optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& opt) 
 
 struct KpoolTopKTransformKernel {
   static constexpr auto kernel = kpool_topk_transform_kernel<kGroupTopK>;
+  static constexpr auto groups_kernel = kpool_groups_transform_kernel<kGroupTopK>;
 
-  static void transform(
-      const tvm::ffi::TensorView score,
-      const tvm::ffi::TensorView lengths,
+  // What both entry points launch with besides their ranking input.
+  struct Target {
+    int32_t out_cols;
+    int32_t token_topk;
+    const int32_t* page_table;
+    int64_t page_table_stride;
+  };
+
+  static Target verify_target(
+      host::SymbolicSize& B,
+      host::SymbolicDevice& device,
       const tvm::ffi::TensorView dst_token_indices,
       const int64_t pool_size,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_opt,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> topk_indices_offset_opt,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts_opt,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> seq_lens_opt,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_row_index_opt) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView>& page_table_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView>& topk_indices_offset_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView>& seq_lens_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView>& page_table_row_index_opt) {
     using namespace host;
 
-    auto B = SymbolicSize{"batch_size"};
-    auto S = SymbolicSize{"score_stride"};
     auto out_cols_sym = SymbolicSize{"out_cols"};
-    auto device = SymbolicDevice{};
-    device.set_options<kDLGPU>();
-
-    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(score);
-    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);
     TensorMatcher({B, out_cols_sym}).with_dtype<int32_t>().with_device(device).verify(dst_token_indices);
 
     RuntimeCheck(pool_size > 1, "pool_size must be > 1, got ", pool_size);
@@ -406,8 +456,6 @@ struct KpoolTopKTransformKernel {
         kGroupTopK,
         " but got ",
         token_topk / static_cast<int32_t>(pool_size));
-
-    const auto batch_size = static_cast<uint32_t>(B.unwrap());
 
     int64_t page_table_stride = 0;
     const int32_t* page_table_ptr = nullptr;
@@ -431,14 +479,45 @@ struct KpoolTopKTransformKernel {
     if (topk_indices_offset_opt.has_value()) {
       TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(topk_indices_offset_opt.value());
     }
-    if (row_starts_opt.has_value()) {
-      TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(row_starts_opt.value());
-    }
     if (seq_lens_opt.has_value()) {
       TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(seq_lens_opt.value());
     }
     if (page_table_row_index_opt.has_value()) {
       TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(page_table_row_index_opt.value());
+    }
+    return Target{out_cols, token_topk, page_table_ptr, page_table_stride};
+  }
+
+  static void transform(
+      const tvm::ffi::TensorView score,
+      const tvm::ffi::TensorView lengths,
+      const tvm::ffi::TensorView dst_token_indices,
+      const int64_t pool_size,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> topk_indices_offset_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> seq_lens_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_row_index_opt) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto S = SymbolicSize{"score_stride"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLGPU>();
+
+    TensorMatcher({B, -1}).with_strides({S, 1}).with_dtype<float>().with_device(device).verify(score);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);
+    const auto target = verify_target(
+        B,
+        device,
+        dst_token_indices,
+        pool_size,
+        page_table_opt,
+        topk_indices_offset_opt,
+        seq_lens_opt,
+        page_table_row_index_opt);
+    if (row_starts_opt.has_value()) {
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(row_starts_opt.value());
     }
 
     const auto params = FastTopKParams{
@@ -450,16 +529,68 @@ struct KpoolTopKTransformKernel {
     };
 
     runtime::set_max_dynamic_smem_per_device<kernel>(device.unwrap().device_id, kSmem);
-    LaunchKernel(batch_size, kThreadsPerBlock, device.unwrap(), kSmem)(
+    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kThreadsPerBlock, device.unwrap(), kSmem)(
         kernel,
         params,
         static_cast<int32_t*>(dst_token_indices.data_ptr()),
         static_cast<int64_t>(dst_token_indices.strides()[0]),
         static_cast<int32_t>(pool_size),
-        token_topk,
-        out_cols,
-        page_table_ptr,
-        page_table_stride,
+        target.token_topk,
+        target.out_cols,
+        target.page_table,
+        target.page_table_stride,
+        optional_data_ptr<int32_t>(page_table_row_index_opt),
+        optional_data_ptr<int32_t>(topk_indices_offset_opt),
+        optional_data_ptr<int32_t>(seq_lens_opt));
+  }
+
+  static void transform_groups(
+      const tvm::ffi::TensorView groups,
+      const tvm::ffi::TensorView lengths,
+      const tvm::ffi::TensorView dst_token_indices,
+      const int64_t pool_size,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> topk_indices_offset_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> seq_lens_opt,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table_row_index_opt) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto G = SymbolicSize{"groups_stride"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLGPU>();
+
+    TensorMatcher({B, int64_t{kGroupTopK}})
+        .with_strides({G, 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(groups);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(lengths);
+    const auto target = verify_target(
+        B,
+        device,
+        dst_token_indices,
+        pool_size,
+        page_table_opt,
+        topk_indices_offset_opt,
+        seq_lens_opt,
+        page_table_row_index_opt);
+    if (B.unwrap() == 0) {
+      return;
+    }
+
+    LaunchKernel(static_cast<uint32_t>(B.unwrap()), kGroupsThreadsPerBlock, device.unwrap())(
+        groups_kernel,
+        static_cast<const int32_t*>(groups.data_ptr()),
+        static_cast<int64_t>(G.unwrap()),
+        static_cast<const int32_t*>(lengths.data_ptr()),
+        static_cast<int32_t*>(dst_token_indices.data_ptr()),
+        static_cast<int64_t>(dst_token_indices.strides()[0]),
+        static_cast<int32_t>(pool_size),
+        target.token_topk,
+        target.out_cols,
+        target.page_table,
+        target.page_table_stride,
         optional_data_ptr<int32_t>(page_table_row_index_opt),
         optional_data_ptr<int32_t>(topk_indices_offset_opt),
         optional_data_ptr<int32_t>(seq_lens_opt));
