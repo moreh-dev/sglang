@@ -1181,6 +1181,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # GLM-5.3-Flash KDA decode on gfx950 (SGLANG_USE_AITER=1): fold the f_b / g_b gate
+    # projections, conv, recurrence and gated RMSNorm into one kernel per layer.
+    SGLANG_OPT_GLM53_KDA_FOLD_DECODE = EnvBool(False)
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
