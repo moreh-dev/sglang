@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention import kda_fold_decode_gfx950, kda_fused_decode
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
@@ -599,6 +599,10 @@ class Glm5NextLinearAttention(nn.Module):
         # below the cap offer the fused KDA kernel, 0 keeps the unfused chain.
         self.attn._k3_fused_decode_args = None
         self._kda_fused_decode_max_tokens = 0
+        # Set by _prepare_fold_decode(): decode batches then skip fused_fg_b_proj, hand
+        # [f_a | g_a] to the backend as `a` (_kda_fold_gates) and get the normed output back.
+        self.attn._kda_fold_decode_args = None
+        self.attn._kda_fold_gates = False
         self._direct_weight_update_error = None
 
     def _prepare_fused_decode(self) -> None:
@@ -649,6 +653,43 @@ class Glm5NextLinearAttention(nn.Module):
         )
         self._direct_weight_update_error = (
             "load_format='direct' does not refresh the GLM-5.3-Flash fused KDA "
+            "decode buffers; update weights with the default load format."
+        )
+
+    def _prepare_fold_decode(self) -> None:
+        """Static inputs of the folded gfx950 KDA decode kernel (kda_fold_decode_gfx950),
+        stashed on the attention layer for the KDA backend: the [3, 4, seg] conv weight copy,
+        the f_b / g_b weights (views of fused_fg_b_proj), flat A_log and the output-norm
+        weight. The conv copy is rebuilt in place on later weight loads, since captured CUDA
+        graphs hold it."""
+        layer = self.attn
+        if (
+            not envs.SGLANG_OPT_GLM53_KDA_FOLD_DECODE.get()
+            or not _use_aiter_gfx95
+            or not kda_fold_decode_gfx950.available()
+            or not self.do_fuse_qkvbfg
+            or self.head_dim != 128
+            or self.conv_size != 4
+            or layer.lower_bound is None
+            or layer.bias is not None
+            or layer.conv_weights.dtype != torch.float32
+            or self.fused_fg_b_proj.weight.dtype != torch.bfloat16
+        ):
+            return
+        seg = self.local_num_heads * self.head_dim
+        conv_weight = layer.conv_weights.view(3, seg, self.conv_size).transpose(1, 2)
+        fg_b_weight = self.fused_fg_b_proj.weight  # [2, seg, head_dim], f_b then g_b
+        old = layer._kda_fold_decode_args
+        layer._kda_fold_decode_args = (
+            bind_or_assign(None if old is None else old[0], conv_weight.contiguous()),
+            fg_b_weight[0],
+            fg_b_weight[1],
+            layer.A_log.detach().reshape(-1),
+            self.o_norm.weight.data,
+            float(self.o_norm.eps),
+        )
+        self._direct_weight_update_error = (
+            "load_format='direct' does not refresh the GLM-5.3-Flash folded KDA "
             "decode buffers; update weights with the default load format."
         )
 
@@ -707,6 +748,25 @@ class Glm5NextLinearAttention(nn.Module):
 
         gathered_rows = hidden_states.shape[0]
         hidden_states = cp_interleave_to_sequence_order(hidden_states, forward_batch)
+
+        # Linear attention dispatches on the logical mode: these batches reach forward_decode.
+        if (
+            self.attn._kda_fold_decode_args is not None
+            and forward_batch.logical_forward_mode.is_decode()
+        ):
+            mixed_qkv, beta, fg_a_states = torch.split(
+                self.fused_qkvbfg_a_proj(hidden_states), self.split_sizes, dim=-1
+            )
+            self.attn._kda_fold_gates = True
+            core_attn_out = self.attn(
+                forward_batch, mixed_qkv=mixed_qkv, a=fg_a_states, b=beta.unsqueeze(0)
+            )
+            self.attn._kda_fold_gates = False
+            return cp_sequence_to_interleave_order(
+                self.o_proj(core_attn_out.squeeze(0).flatten(-2))[0],
+                forward_batch,
+                gathered_rows,
+            )
 
         if self.do_fuse_qkvbfg:
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
@@ -2019,11 +2079,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def _prepare_fused_decode_layers(self) -> None:
         if self.model is None:
             return
+        num_kda, num_folded = 0, 0
         for layer in self.model.layers:
             if not isinstance(layer, PPMissingLayer) and isinstance(
                 layer.self_attn, Glm5NextLinearAttention
             ):
                 layer.self_attn._prepare_fused_decode()
+                layer.self_attn._prepare_fold_decode()
+                num_kda += 1
+                num_folded += layer.self_attn.attn._kda_fold_decode_args is not None
+        if envs.SGLANG_OPT_GLM53_KDA_FOLD_DECODE.get():
+            log_info_on_rank0(
+                logger,
+                f"GLM-5.3-Flash folded KDA decode (gfx950): {num_folded}/{num_kda} layers.",
+            )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:

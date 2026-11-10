@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention import kda_fold_decode_gfx950, kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -806,6 +806,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
 
+        # GLM-5.3-Flash skipped its gate projections for this batch (glm5_next.py),
+        # so `a` is [f_a | g_a] and the folded kernel also applies o_norm.
+        if getattr(layer, "_kda_fold_gates", False):
+            if replayssm_d is not None:
+                raise ValueError(
+                    "SGLANG_OPT_GLM53_KDA_FOLD_DECODE does not support "
+                    "--enable-linear-replayssm."
+                )
+            core_attn_out = self._forward_decode_fold(
+                layer=layer,
+                mixed_qkv=mixed_qkv,
+                fg_a=a,
+                b=b,
+                conv_states=conv_states,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+            )
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+            )
+            return core_attn_out
+
         deferred_f_b = bool(getattr(layer, "_k3_deferred_f_b", False))
         if replayssm_d is None and deferred_f_b and is_gfx95_supported():
             fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
@@ -1029,6 +1051,44 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         return core_attn_out
+
+    @staticmethod
+    def _forward_decode_fold(
+        *,
+        layer: RadixLinearAttention,
+        mixed_qkv: torch.Tensor,
+        fg_a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        conv_weight, w_fb, w_gb, a_log, norm_weight, norm_eps = (
+            layer._kda_fold_decode_args
+        )
+        out = mixed_qkv.new_empty(
+            (mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim)
+        )
+        kda_fold_decode_gfx950.kda_fold_decode(
+            mixed_qkv=mixed_qkv,
+            f_a=fg_a[:, : layer.head_k_dim],
+            g_a=fg_a[:, layer.head_k_dim :],
+            w_fb=w_fb,
+            w_gb=w_gb,
+            beta=b[0],
+            A_log=a_log,
+            dt_bias=layer.dt_bias,
+            lower_bound=float(layer.lower_bound),
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            # The KDA pool keeps conv states as [slot, kernel - 1, dim].
+            conv_state=conv_states.transpose(-1, -2),
+            conv_weight=conv_weight,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            out=out,
+        )
+        return out.unsqueeze(0)
 
     def _convolve_prefill(
         self,
