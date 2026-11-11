@@ -4743,6 +4743,9 @@ class HybridLinearKVPool(KVCache):
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
         round_scale: bool = False,
+        k_norm_weight: Optional[torch.Tensor] = None,
+        k_norm_bias: Optional[torch.Tensor] = None,
+        k_norm_eps: float = 0.0,
     ) -> None:
         assert self.use_dsa, (
             "kpool_decode_update_index_cache called when use_dsa is False"
@@ -4759,6 +4762,9 @@ class HybridLinearKVPool(KVCache):
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             round_scale=round_scale,
+            k_norm_weight=k_norm_weight,
+            k_norm_bias=k_norm_bias,
+            k_norm_eps=k_norm_eps,
         )
 
     def set_compress_tail_for_request(
@@ -5652,6 +5658,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_lens: torch.Tensor,
         out_cache_loc: torch.Tensor,
         round_scale: bool = False,
+        k_norm_weight: Optional[torch.Tensor] = None,
+        k_norm_bias: Optional[torch.Tensor] = None,
+        k_norm_eps: float = 0.0,
     ) -> None:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             kpool_decode_update_and_maybe_write_cache,
@@ -5676,6 +5685,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             round_scale=round_scale,
+            k_norm_weight=k_norm_weight,
+            k_norm_bias=k_norm_bias,
+            k_norm_eps=k_norm_eps,
         )
 
     def set_compress_tail_for_request(

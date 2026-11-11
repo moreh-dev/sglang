@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -65,6 +66,21 @@ from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.srt.runtime_context import get_device, get_exec
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
+
+
+_FUSED_K_NORM_OK: Optional[bool] = None
+
+
+@functools.lru_cache(maxsize=None)
+def _hip_wave64() -> bool:
+    # The fused k_norm reproduces torch's LayerNorm reduction tree for 64-wide
+    # wavefronts (CDNA); RDNA (wave32) would need a different tree.
+    return (
+        _is_hip and getattr(torch.cuda.get_device_properties(0), "warp_size", 64) == 64
+    )
+
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -354,6 +370,7 @@ class IndexerKPool(MultiPlatformOp):
         forward_batch,
         layer_id,
         metadata,
+        key_is_normed: bool = True,
     ):
         batch = key.shape[0]
         if batch == 0:
@@ -363,6 +380,17 @@ class IndexerKPool(MultiPlatformOp):
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
 
+        # key_is_normed=False: key is the raw wk output and k_norm runs inside
+        # the cache-write kernel (see _forward_hip_decode).
+        norm_kwargs = (
+            {}
+            if key_is_normed
+            else dict(
+                k_norm_weight=self.k_norm.weight,
+                k_norm_bias=self.k_norm.bias,
+                k_norm_eps=self.k_norm.variance_epsilon,
+            )
+        )
         pool.kpool_decode_update_index_cache(
             layer_id=layer_id,
             key=key,
@@ -374,6 +402,7 @@ class IndexerKPool(MultiPlatformOp):
             seq_lens=metadata.get_seqlens_int32()[:batch],
             out_cache_loc=forward_batch.out_cache_loc[:batch],
             round_scale=self.scale_fmt is not None,
+            **norm_kwargs,
         )
 
     def _compress_write_extend(
@@ -608,6 +637,7 @@ class IndexerKPool(MultiPlatformOp):
         gate_score: Optional[torch.Tensor] = None,
         return_compressed: bool = False,
         write_cache: bool = True,
+        key_is_normed: bool = True,
     ):
         if gate_score is None:
             gate_score = F.linear(x, self.index_kpool_compress_gate)
@@ -628,8 +658,10 @@ class IndexerKPool(MultiPlatformOp):
                 forward_batch=forward_batch,
                 layer_id=layer_id,
                 metadata=metadata,
+                key_is_normed=key_is_normed,
             )
         elif forward_batch.forward_mode.is_extend():
+            assert key_is_normed, "extend expects a k_norm-ed key"
             return self._compress_write_extend(
                 key=key,
                 gate_score=gate_score,
@@ -773,6 +805,7 @@ class IndexerKPool(MultiPlatformOp):
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
         topk_v2_plan: Optional[torch.Tensor] = None,
+        out_col_align: int = 1,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
@@ -802,6 +835,7 @@ class IndexerKPool(MultiPlatformOp):
             out_rows=out_rows,
             page_table_row_index=page_table_row_index,
             topk_v2_plan=topk_v2_plan,
+            out_col_align=out_col_align,
         )
 
     def _get_kpool_decode_metadata(
@@ -1097,6 +1131,12 @@ class IndexerKPool(MultiPlatformOp):
             page_table=page_table_1,
             topk_offsets=topk_offsets,
             out_rows=num_q_padded if num_q_padded != n_real else None,
+            out_col_align=(
+                getattr(metadata, "topk_out_col_align", 1)
+                if forward_batch.forward_mode.is_decode_or_idle()
+                and page_table_1 is not None
+                else 1
+            ),
         )
         return topk_result
 
@@ -1667,6 +1707,102 @@ class IndexerKPool(MultiPlatformOp):
             return None
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
+    def _use_hip_decode_path(
+        self, forward_batch: ForwardBatch, enable_dual_stream: bool
+    ) -> bool:
+        """ROCm decode with the fused secondary kernels (_forward_hip_decode).
+
+        Needs: no RoPE between wq_b and the Hadamard (it moves into the quant
+        kernel), one 128-wide quant block per head and the single-stream
+        schedule. k_norm is fused only when _fused_k_norm_ok()."""
+        return (
+            _is_hip
+            and _hip_wave64()
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and not enable_dual_stream
+            and (self.skip_rope or self.rope_head_dim == 0)
+            and self.head_dim == 128
+            and self.block_size == self.head_dim
+        )
+
+    def _fused_k_norm_ok(self) -> bool:
+        """k_norm can run inside the cache-write kernel: an fp32 LayerNorm over
+        128 that the kernel reproduces bit for bit on this torch build (checked
+        once, outside any CUDA-graph capture)."""
+        global _FUSED_K_NORM_OK
+        if not (
+            isinstance(self.k_norm, LayerNorm)
+            and self.k_norm.dtype == torch.float32
+            and self.k_norm.hidden_size == 128
+            and self.k_norm.elementwise_affine
+            and self.k_norm.use_bias
+        ):
+            return False
+        if _FUSED_K_NORM_OK is None:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+                layernorm128_matches_torch,
+            )
+
+            _FUSED_K_NORM_OK = layernorm128_matches_torch(self.k_norm)
+            if not _FUSED_K_NORM_OK:
+                logger.warning(
+                    "k-pool indexer: the fused k_norm does not reproduce this torch "
+                    "build's LayerNorm bit for bit; k_norm runs as its own kernels."
+                )
+        return _FUSED_K_NORM_OK
+
+    def _forward_hip_decode(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+        return_indices: bool,
+    ) -> Optional[torch.Tensor]:
+        """Decode indexer with its secondary kernels folded into their consumers:
+
+        * k_norm (bf16->fp32 cast, layer_norm, fp32->bf16 cast) runs inside the
+          k-pool cache-write kernel, on the raw wk output;
+        * the query Hadamard, act_quant and the head-gate scaling are one kernel
+          (kpool_q_rotate_quant_gate).
+        Same results as the generic path, bit for bit.
+        """
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            kpool_q_rotate_quant_gate,
+        )
+
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        key, _ = self.wk(x)
+        fuse_k_norm = self._fused_k_norm_ok()
+        if not fuse_k_norm:
+            key = self.k_norm(key)
+        self._compress_write(
+            x=x,
+            key=key,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            metadata=metadata,
+            key_is_normed=not fuse_k_norm,
+        )
+        if not return_indices:
+            return None
+        head_weights, _ = self.weights_proj(x.float())
+        q_fp8, weights = kpool_q_rotate_quant_gate(
+            query,
+            head_weights,
+            rotate=True,
+            round_scale=self.scale_fmt is not None,
+            weight_scale_1=self.n_heads**-0.5,
+            weight_scale_2=self.softmax_scale,
+        )
+        return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1774,6 +1910,17 @@ class IndexerKPool(MultiPlatformOp):
                 act_quant=act_quant,
                 metadata=metadata,
                 enable_dual_stream=enable_dual_stream,
+                return_indices=return_indices,
+            )
+
+        if self._use_hip_decode_path(forward_batch, enable_dual_stream):
+            return self._forward_hip_decode(
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                metadata=metadata,
                 return_indices=return_indices,
             )
 

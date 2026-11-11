@@ -165,6 +165,8 @@ def prepare_kv_for_attention(
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+# TileLang sparse attention reads the top-k page table in 64-column blocks.
+_TILELANG_TOPK_COL_BLOCK = 64
 _is_xpu = is_xpu()
 
 if _is_hip:
@@ -3735,7 +3737,7 @@ class DeepseekSparseAttnBackend(
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,
         # so mask-pad the tail-extended table to the next complete block.
-        padding = (-page_table_1.shape[-1]) % 64
+        padding = (-page_table_1.shape[-1]) % _TILELANG_TOPK_COL_BLOCK
         if padding:
             page_table_1 = torch.cat(
                 (
@@ -4586,7 +4588,25 @@ class DeepseekSparseAttnBackend(
             force_unfused_topk=force_unfused,
             packed_extend_topk=self.dsa_packed_extend_topk,
             dcp_size=1 if self.dsa_shards_index_k else self.attn_dcp_size,
+            topk_out_col_align=self._decode_topk_out_col_align(forward_batch),
         )
+
+    def _decode_topk_out_col_align(self, forward_batch: ForwardBatch) -> int:
+        """Let the k-pool indexer emit TileLang's padded top-k width directly.
+
+        forward_decode hands fused top-k indices to _forward_tilelang unchanged,
+        which otherwise pads them to a 64-column multiple with cat + fill in
+        every DSA layer."""
+        if (
+            _is_hip
+            and self.dsa_index_kpool > 1
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and self.dsa_decode_impl == "tilelang"
+            and self.use_fused_topk
+            and self.hisparse_coordinator is None
+        ):
+            return _TILELANG_TOPK_COL_BLOCK
+        return 1
 
     def _compute_flashmla_metadata(
         self,

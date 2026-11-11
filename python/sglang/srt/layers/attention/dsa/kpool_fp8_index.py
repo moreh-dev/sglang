@@ -773,7 +773,10 @@ def topk_from_pooled_history_logits(
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
     topk_v2_plan: torch.Tensor | None = None,
+    out_col_align: int = 1,
 ) -> torch.Tensor:
+    """``out_col_align`` only reaches the fused JIT path (the ROCm decode path);
+    the other paths return the unpadded width and the consumer pads as before."""
     assert logits.ndim == 2
     assert group_lengths.ndim == 1
     assert logits.shape[0] == group_lengths.shape[0]
@@ -830,6 +833,7 @@ def topk_from_pooled_history_logits(
             row_starts=row_starts,
             seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
             page_table_row_index=page_table_row_index,
+            out_col_align=out_col_align,
         )
         if out_rows is None or out_rows == result.shape[0]:
             return result
@@ -1026,7 +1030,19 @@ def kpool_decode_update_and_maybe_write_cache(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
     round_scale: bool = False,
+    k_norm_weight: Optional[torch.Tensor] = None,
+    k_norm_bias: Optional[torch.Tensor] = None,
+    k_norm_eps: float = 0.0,
 ) -> None:
+    """Pool the decode token's key into its request tail and, when the tail closes
+    a pool, write the compressed index-K row.
+
+    With ``k_norm_weight`` / ``k_norm_bias`` the key is the raw ``wk`` output and
+    the indexer's LayerNorm runs here, reproducing ``LayerNorm.forward_native``
+    (fp32 LayerNorm, bf16 result) bit for bit on ROCm, instead of as three
+    kernels (cast, layer_norm, cast) before this one.
+    """
+    apply_norm = k_norm_weight is not None
     assert tail_k.ndim == 3
     assert tail_score.shape == tail_k.shape
     assert tail_k.shape[1] == pool.index_kpool + pool.tail_extra_slots
@@ -1039,6 +1055,11 @@ def kpool_decode_update_and_maybe_write_cache(
     assert tail_score.dtype in KPOOL_SCORE_DTYPES
     assert slot_score.dtype == tail_score.dtype
     assert ape.dtype == torch.float32
+    if apply_norm:
+        assert k_norm_bias is not None
+        assert k_norm_weight.shape == (INDEX_HEAD_DIM,)
+        assert k_norm_bias.shape == (INDEX_HEAD_DIM,)
+        assert k_norm_weight.dtype == k_norm_bias.dtype == torch.float32
     assert buf.dtype == torch.uint8
     assert pool.index_page_size == BLOCK_SIZE_K
     assert pool.index_head_dim == INDEX_HEAD_DIM
@@ -1100,6 +1121,10 @@ def kpool_decode_update_and_maybe_write_cache(
         ROUND_SCALE=round_scale,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
         INDEX_PAGE_SIZE=pool.index_page_size,
+        norm_w_ptr=k_norm_weight if apply_norm else ape,
+        norm_b_ptr=k_norm_bias if apply_norm else ape,
+        norm_eps=float(k_norm_eps),
+        APPLY_NORM=apply_norm,
     )
 
 
@@ -1123,6 +1148,71 @@ def _hadamard128(x):
     x = _hadamard128_stage(x, 2, 32)
     x = _hadamard128_stage(x, 1, 64)
     return x * 0.08838834764831845
+
+
+@triton.jit
+def _welford_combine_equal(m_b, s_b, m_a, s_a, count: tl.constexpr):
+    # torch's cuWelfordCombine(dataB, dataA) for two halves of equal power-of-2
+    # count: nA = nB = 0.5 exactly, so only the operation order matters.
+    delta = m_b - m_a
+    mean = 0.5 * m_a + 0.5 * m_b
+    m2 = (s_a + s_b) + ((delta * delta) * count) * 0.5
+    return mean, m2
+
+
+@triton.jit
+def _lane_halves(v, N: tl.constexpr):
+    # [2N] lanes -> (lanes 0..N-1, lanes N..2N-1)
+    lo, hi = tl.split(tl.trans(tl.reshape(v, (2, N)), 1, 0))
+    return lo, hi
+
+
+@triton.jit
+def _layernorm128_rocm_torch(x, w, b, eps):
+    """fp32 LayerNorm of one 128-wide row, op for op as torch's
+    vectorized_layer_norm_kernel runs it on ROCm (wave64, vec 4): lane i
+    Welford-accumulates x[4i:4i+4], lanes 0..31 tree-combine with shuffle
+    offsets 16..1 (offset 32 and the other warps hold no data), then
+    y = gamma * (rstd * (x - mean)) + beta.
+
+    ROCm torch builds default to PYTORCH_LAYERNORM_FAST_RECIPROCAL, which takes
+    1 / count from v_rcp_f32: exact for powers of two, 0x3EAAAAAA (not the
+    correctly rounded 0x3EAAAAAB) for 3. layernorm128_matches_torch() checks the
+    installed torch against this kernel before the fused path is used."""
+    x4 = tl.reshape(x, (32, 2, 2))
+    even, odd = tl.split(x4)
+    x0, x2 = tl.split(even)
+    x1, x3 = tl.split(odd)
+    mean = x0
+    m2 = tl.zeros_like(x0)
+    delta = x1 - mean
+    mean = mean + delta * 0.5
+    m2 = m2 + delta * (x1 - mean)
+    delta = x2 - mean
+    mean = mean + delta * 0.3333333134651184  # v_rcp_f32(3.0)
+    m2 = m2 + delta * (x2 - mean)
+    delta = x3 - mean
+    mean = mean + delta * 0.25
+    m2 = m2 + delta * (x3 - mean)
+    m_b, m_a = _lane_halves(mean, 16)
+    s_b, s_a = _lane_halves(m2, 16)
+    mean, m2 = _welford_combine_equal(m_b, s_b, m_a, s_a, 4.0)
+    m_b, m_a = _lane_halves(mean, 8)
+    s_b, s_a = _lane_halves(m2, 8)
+    mean, m2 = _welford_combine_equal(m_b, s_b, m_a, s_a, 8.0)
+    m_b, m_a = _lane_halves(mean, 4)
+    s_b, s_a = _lane_halves(m2, 4)
+    mean, m2 = _welford_combine_equal(m_b, s_b, m_a, s_a, 16.0)
+    m_b, m_a = _lane_halves(mean, 2)
+    s_b, s_a = _lane_halves(m2, 2)
+    mean, m2 = _welford_combine_equal(m_b, s_b, m_a, s_a, 32.0)
+    m_b, m_a = tl.split(tl.reshape(mean, (1, 2)))
+    s_b, s_a = tl.split(tl.reshape(m2, (1, 2)))
+    mean, m2 = _welford_combine_equal(m_b, s_b, m_a, s_a, 64.0)
+    mean = tl.sum(mean, axis=0)
+    var = tl.sum(m2, axis=0) / 128.0
+    rstd = tl.math.rsqrt(var + eps)
+    return tl.fma(w, rstd * (x - mean), b)
 
 
 @triton.jit
@@ -1282,6 +1372,10 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     ROUND_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_PAGE_SIZE: tl.constexpr,
+    norm_w_ptr,
+    norm_b_ptr,
+    norm_eps,
+    APPLY_NORM: tl.constexpr,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_D)
@@ -1305,6 +1399,16 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
         mask=dim_mask,
         other=0.0,
     ).to(tl.float32)
+    if APPLY_NORM:
+        tl.static_assert(BLOCK_D == 128)
+        tl.static_assert(HEAD_DIM == 128)
+        key = _layernorm128_rocm_torch(
+            key,
+            tl.load(norm_w_ptr + offs),
+            tl.load(norm_b_ptr + offs),
+            norm_eps,
+        )
+        key = key.to(tl.bfloat16).to(tl.float32)
     score_current = tl.load(
         slot_score_ptr + row * slot_score_stride_0 + offs,
         mask=dim_mask,
@@ -1415,6 +1519,56 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     update_mask = dim_mask & pos_valid
     tl.store(tail_k_ptr + tail_k_offset, key, mask=update_mask)
     tl.store(tail_score_ptr + tail_score_offset, score_current, mask=update_mask)
+
+
+@triton.jit
+def _kpool_q_rotate_quant_gate_kernel(
+    q_ptr,
+    q_stride_t,
+    q_stride_h,
+    q_fp8_ptr,
+    w_ptr,
+    w_stride_t,
+    w_out_ptr,
+    N_HEADS: tl.constexpr,
+    ROTATE: tl.constexpr,
+    ROUND_SCALE: tl.constexpr,
+    W_SCALE_1: tl.constexpr,
+    W_SCALE_2: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    FP8_MAX_INV: tl.constexpr,
+):
+    """One (token, head) row of the indexer query: Hadamard rotation (bf16
+    result, as fast_hadamard_transform), 128-wide fp8 quantization (as the
+    TileLang act_quant, ue8m0 scales when ROUND_SCALE), and the head gate
+    w * W_SCALE_1 * q_scale * W_SCALE_2 in the order _get_logits_head_gate
+    multiplies."""
+    pid = tl.program_id(0)
+    t = pid // N_HEADS
+    h = pid % N_HEADS
+    offs = tl.arange(0, 128)
+    x = tl.load(q_ptr + t * q_stride_t + h * q_stride_h + offs).to(tl.float32)
+    if ROTATE:
+        x = _hadamard128(x).to(tl.bfloat16).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
+    if ROUND_SCALE:
+        # TileLang fast_round_scale: 2 ** ceil(log2(amax / fp8_max)) from the bits
+        bits = (amax * FP8_MAX_INV).to(tl.uint32, bitcast=True)
+        e = (
+            ((bits >> 23) & 0xFF).to(tl.int32)
+            - 127
+            + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        )
+        scale = ((e + 127).to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    else:
+        scale = amax * FP8_MAX_INV
+    y = tl.minimum(tl.maximum(x / scale, -FP8_MAX), FP8_MAX)
+    tl.store(q_fp8_ptr + pid * 128 + offs, y.to(q_fp8_ptr.dtype.element_ty))
+    w = tl.load(w_ptr + t * w_stride_t + h).to(tl.float32)
+    w = w * W_SCALE_1
+    w = w * scale
+    w = w * W_SCALE_2
+    tl.store(w_out_ptr + pid, w)
 
 
 @triton.jit
@@ -1993,3 +2147,76 @@ def kpool_write_tail_and_maybe_compress(
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
         MAX_CLOSED_POOLS=max_closed_pools,
     )
+
+
+def kpool_q_rotate_quant_gate(
+    query: torch.Tensor,
+    head_weights: torch.Tensor,
+    *,
+    rotate: bool,
+    round_scale: bool,
+    weight_scale_1: float,
+    weight_scale_2: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Decode query prep of the k-pool indexer in one launch.
+
+    Replaces rotate_activation(query) -> act_quant(query, 128) -> the head-gate
+    scaling of IndexerKPool._get_logits_head_gate. ``query`` is [n, heads, 128]
+    (any token / head stride, unit inner stride), ``head_weights`` the raw
+    weights_proj output [n, heads] (unit inner stride). Returns q_fp8 [n, heads,
+    128] and the logits weights [n, heads, 1] fp32.
+    """
+    from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+
+    n, heads, dim = query.shape
+    assert dim == 128 and query.stride(2) == 1
+    assert head_weights.shape == (n, heads) and head_weights.stride(1) == 1
+    fnuz = is_fp8_fnuz()
+    fp8_max = 224.0 if fnuz else 448.0
+    q_fp8 = torch.empty(
+        (n, heads, dim),
+        dtype=torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn,
+        device=query.device,
+    )
+    weights = torch.empty((n, heads, 1), dtype=torch.float32, device=query.device)
+    if n == 0:
+        return q_fp8, weights
+    _kpool_q_rotate_quant_gate_kernel[(n * heads,)](
+        query,
+        query.stride(0),
+        query.stride(1),
+        q_fp8,
+        head_weights,
+        head_weights.stride(0),
+        weights,
+        N_HEADS=heads,
+        ROTATE=rotate,
+        ROUND_SCALE=round_scale,
+        W_SCALE_1=weight_scale_1,
+        W_SCALE_2=weight_scale_2,
+        FP8_MAX=fp8_max,
+        FP8_MAX_INV=1.0 / fp8_max,
+    )
+    return q_fp8, weights
+
+
+@triton.jit
+def _layernorm128_rows_kernel(x_ptr, w_ptr, b_ptr, y_ptr, eps):
+    r = tl.program_id(0)
+    offs = tl.arange(0, 128)
+    x = tl.load(x_ptr + r * 128 + offs).to(tl.float32)
+    y = _layernorm128_rocm_torch(x, tl.load(w_ptr + offs), tl.load(b_ptr + offs), eps)
+    tl.store(y_ptr + r * 128 + offs, y.to(y_ptr.dtype.element_ty))
+
+
+def layernorm128_matches_torch(k_norm, rows: int = 4096) -> bool:
+    """Whether the fused k_norm reproduces k_norm.forward_native bit for bit on
+    this device / torch build (fixed pseudo-random rows, a few scales)."""
+    w, b = k_norm.weight, k_norm.bias
+    g = torch.Generator(device=w.device).manual_seed(20261110)
+    x = torch.randn(rows, 128, device=w.device, generator=g)
+    x = (x * torch.logspace(-3, 3, rows, device=w.device).view(-1, 1) + 0.25).bfloat16()
+    ref = k_norm.forward_native(x)
+    out = torch.empty_like(ref)
+    _layernorm128_rows_kernel[(rows,)](x, w, b, out, float(k_norm.variance_epsilon))
+    return torch.equal(out, ref)
