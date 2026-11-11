@@ -1051,9 +1051,12 @@ def kpool_decode_update_and_maybe_write_cache(
     assert slot_score.shape == key.shape
     assert ape.shape == (pool.index_kpool, INDEX_HEAD_DIM)
     assert tail_k.dtype == torch.bfloat16
-    assert key.dtype == torch.bfloat16
     assert tail_score.dtype in KPOOL_SCORE_DTYPES
-    assert slot_score.dtype == tail_score.dtype
+    # fp32 key / score: column views of the merged fp32 x-projection GEMM. The
+    # kernel rounds them to bf16 (the wk output dtype) / the tail dtype first.
+    assert key.dtype == torch.bfloat16 or (apply_norm and key.dtype == torch.float32)
+    assert slot_score.dtype in (tail_score.dtype, torch.float32)
+    assert key.stride(-1) == 1 and slot_score.stride(-1) == 1
     assert ape.dtype == torch.float32
     if apply_norm:
         assert k_norm_bias is not None
@@ -1070,8 +1073,7 @@ def kpool_decode_update_and_maybe_write_cache(
     if batch == 0:
         return
 
-    key = key.contiguous()
-    slot_score = slot_score.contiguous()
+    # key / slot_score may be column views (row stride passed below): no copy.
     ape = ape.contiguous()
     req_pool_indices = req_pool_indices.contiguous()
     positions = positions.contiguous()
@@ -1402,6 +1404,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     if APPLY_NORM:
         tl.static_assert(BLOCK_D == 128)
         tl.static_assert(HEAD_DIM == 128)
+        key = key.to(tl.bfloat16).to(tl.float32)  # fp32 GEMM view -> wk's bf16
         key = _layernorm128_rocm_torch(
             key,
             tl.load(norm_w_ptr + offs),
@@ -1409,11 +1412,15 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
             norm_eps,
         )
         key = key.to(tl.bfloat16).to(tl.float32)
-    score_current = tl.load(
-        slot_score_ptr + row * slot_score_stride_0 + offs,
-        mask=dim_mask,
-        other=0.0,
-    ).to(tl.float32)
+    score_current = (
+        tl.load(
+            slot_score_ptr + row * slot_score_stride_0 + offs,
+            mask=dim_mask,
+            other=0.0,
+        )
+        .to(tail_score_ptr.dtype.element_ty)
+        .to(tl.float32)
+    )
 
     if pos_valid & (slot == POOL_SIZE - 1):
         pool_logical_start = safe_pos - slot

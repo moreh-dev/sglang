@@ -1753,6 +1753,38 @@ class IndexerKPool(MultiPlatformOp):
                 )
         return _FUSED_K_NORM_OK
 
+    def _merged_x_proj_weight(self) -> Optional[torch.Tensor]:
+        """[wk; index_kpool_compress_gate; weights_proj] as one [2*head_dim +
+        n_heads, hidden] bf16 weight, built once after weight loading.
+
+        Only when all three are plain bf16 weights and weights_proj (kept in fp32)
+        holds bf16 values, so the merge changes no weight. Built lazily on the
+        first decode, which runs eagerly in CUDA-graph warmup before any capture;
+        never allocated inside a capture. Like the other derived weights, an
+        in-place weight update after that is not seen.
+        """
+        merged = getattr(self, "_x_proj_merged", None)
+        if merged is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            wk = getattr(self.wk, "weight", None)
+            wp = getattr(self.weights_proj, "weight", None)
+            gate = self.index_kpool_compress_gate
+            ok = (
+                isinstance(wk, torch.Tensor)
+                and isinstance(wp, torch.Tensor)
+                and wk.dtype == gate.dtype == torch.bfloat16
+                and wp.dtype == torch.float32
+                and wk.shape == gate.shape == (self.head_dim, self.hidden_size)
+                and wp.shape == (self.n_heads, self.hidden_size)
+            )
+            if ok:
+                wp_bf16 = wp.to(torch.bfloat16)
+                ok = torch.equal(wp_bf16.float(), wp)
+            merged = torch.cat([wk, gate, wp_bf16], dim=0).contiguous() if ok else False
+            self._x_proj_merged = merged
+        return merged if merged is not False else None
+
     def _forward_hip_decode(
         self,
         x: torch.Tensor,
@@ -1777,10 +1809,22 @@ class IndexerKPool(MultiPlatformOp):
 
         query, _ = self.wq_b(q_lora)
         query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-        key, _ = self.wk(x)
+        merged = self._merged_x_proj_weight()
+        if merged is not None:
+            # [wk; compress gate; weights_proj] over the same x: one bf16 GEMM with
+            # fp32 output instead of wk, the gate GEMM, x.float() and the fp32
+            # weights_proj GEMM (+ its split-K reduce). The cache-write kernel
+            # rounds key / gate to bf16; the head gate stays fp32.
+            proj = torch.mm(x, merged.t(), out_dtype=torch.float32)
+            hd = self.head_dim
+            key, gate_score = proj[:, :hd], proj[:, hd : 2 * hd]
+            head_weights = proj[:, 2 * hd :]
+        else:
+            key, _ = self.wk(x)
+            gate_score = head_weights = None
         fuse_k_norm = self._fused_k_norm_ok()
         if not fuse_k_norm:
-            key = self.k_norm(key)
+            key = self.k_norm(key.to(torch.bfloat16))
         self._compress_write(
             x=x,
             key=key,
@@ -1788,11 +1832,13 @@ class IndexerKPool(MultiPlatformOp):
             forward_batch=forward_batch,
             layer_id=layer_id,
             metadata=metadata,
+            gate_score=gate_score,
             key_is_normed=not fuse_k_norm,
         )
         if not return_indices:
             return None
-        head_weights, _ = self.weights_proj(x.float())
+        if head_weights is None:
+            head_weights, _ = self.weights_proj(x.float())
         q_fp8, weights = kpool_q_rotate_quant_gate(
             query,
             head_weights,
