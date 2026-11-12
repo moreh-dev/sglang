@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Fused FP8 MQA logits + top-k (gfx950): shared types and wave-level helpers.
-// See op_tests/fp8_mqa_topk/DESIGN.md.
+// The pipeline is described in csrc/kernels/fp8_mqa_topk.cu.
 #pragma once
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp8.h>
@@ -10,15 +10,15 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace fmt {
+namespace mqa_topk {
 
 template <int I> using IC = std::integral_constant<int, I>;
 using fp8 = __hip_fp8_storage_t;
 constexpr int WARP = 64;
 constexpr int NUM_HEADS = 32;
 constexpr int HEAD_SIZE = 128;
-#define FMT_CDIV(a, b) (((a) + (b) - 1) / (b))
-#define FMT_BUF_RSRC_WORD3 0x00020000
+#define MQA_TOPK_CDIV(a, b) (((a) + (b) - 1) / (b))
+#define MQA_TOPK_BUF_RSRC_WORD3 0x00020000
 
 using f8x16 = __attribute__((__vector_size__(16))) fp8;
 using f8x32 = __attribute__((__vector_size__(32))) fp8;
@@ -54,7 +54,7 @@ __device__ __forceinline__ i32x4 raw_rsrc(const void* p, int bytes) {
     r[0] = __builtin_amdgcn_readfirstlane((int)(uint32_t)a);
     r[1] = __builtin_amdgcn_readfirstlane((int)(uint32_t)(a >> 32) & 0xffff);
     r[2] = __builtin_amdgcn_readfirstlane(bytes);
-    r[3] = FMT_BUF_RSRC_WORD3;
+    r[3] = MQA_TOPK_BUF_RSRC_WORD3;
     return r;
 }
 
@@ -68,31 +68,11 @@ __device__ __forceinline__ int wave_incl_scan(int x, int lane) {
     return x;
 }
 __device__ __forceinline__ void mem_fence_wave() { asm volatile("" ::: "memory"); }
-// Agent-scope release written out by hand, issued by the lane that then stores / RMWs the flag: this wave's memory ops
-// complete, the XCD L2 is written back (covering the other waves' stores that completed before the WG barrier), and
-// the writeback completes. The compiler's own release sequence (buffer_wbl2 sc1; s_waitcnt vmcnt(0); store) loses
-// the second wait whenever SIInsertWaitcnts' scoreboard is empty - it does not count buffer_wbl2 (seen in two release
-// sites of a gfx950 build; LLVM fixed it upstream) - and inline asm cannot be removed. tools/wbl2check.py checks the ISA.
-#define FMT_RELEASE_AGENT() asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\tbuffer_wbl2 sc1\n\ts_waitcnt vmcnt(0)" ::: "memory")
-
-// Loads of data written earlier IN THIS KERNEL (by this or another workgroup): relaxed atomic loads at agent scope,
-// which gfx94x/gfx950 lower to global_load ... sc1 (not served from a possibly stale vector-L1 line). Cross-XCD
-// producers additionally need a release/acquire pair (see fmt_select.cuh).
-__device__ __forceinline__ float load_f32_coh(const float* p) {
-    return __builtin_bit_cast(float, __hip_atomic_load(reinterpret_cast<const uint32_t*>(p), __ATOMIC_RELAXED,
-                                                       __HIP_MEMORY_SCOPE_AGENT));
-}
-__device__ __forceinline__ unsigned long long load_u64_coh(const unsigned long long* p) {
-    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-}
-__device__ __forceinline__ int load_i32_coh(const int* p) {
-    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-}
 
 // candidate slot of row m, split s, index i: interleaved pair segments of 2*CAP u64 (rows 2p, 2p+1), Mp = M rounded
-// up to even. The scan writes this layout; every select reads it.
+// up to even. The scan writes this layout; the select reads it.
 __host__ __device__ __forceinline__ int64_t cand_index(int s, int m, int i, int Mp, int CAP) {
     return ((int64_t)s * Mp + (m & ~1)) * CAP + 2 * (int64_t)i + (m & 1);
 }
 
-}  // namespace fmt
+}  // namespace mqa_topk

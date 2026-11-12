@@ -36,7 +36,7 @@ def hip_fp8_mqa_topk_enabled() -> bool:
         return False
     logger.info(
         "DSA kpool: prefill indexer logits + top-k by the in-tree HIP "
-        "fp8_mqa_topk kernel (Step 0)"
+        "fp8_mqa_topk kernel (rocm-aiter PR #18)"
     )
     return True
 

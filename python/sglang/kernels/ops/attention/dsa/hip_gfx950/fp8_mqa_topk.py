@@ -1,4 +1,4 @@
-"""In-tree HIP prefill indexer logits + top-k for GLM-5.3-Flash on gfx950 (Step 0).
+"""In-tree HIP prefill indexer logits + top-k for GLM-5.3-Flash on gfx950.
 
 JIT build + load of ``kernels/jit/csrc/dsa_gfx950/fp8_mqa_topk.cuh`` on the first
 gated call. Each row's top ``TOPK`` key ids of
@@ -8,7 +8,7 @@ gated call. Each row's top ``TOPK`` key ids of
 for n in [ks[m], ke[m]), without storing the fp32 [rows, keys] logits; the .cuh
 describes the pipeline. The result is the exact top-k of the logits its scan
 computes (ties broken arbitrarily). n_heads=32, head_dim=128, TOPK=512 only;
-``is_supported`` gates on the shape.
+``is_supported`` gates on the shape. Device code: moreh-dev/rocm-aiter#18.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ _CUDA_CFLAGS = [
 @cache_once
 def module() -> Module:
     return load_jit(
-        "dsa_gfx950_fp8_mqa_topk_step0",
+        "dsa_gfx950_fp8_mqa_topk",
         cuda_files=["dsa_gfx950/fp8_mqa_topk.cuh"],
         cuda_wrappers=[
             ("plan", "Fp8MqaTopkKernel::plan"),

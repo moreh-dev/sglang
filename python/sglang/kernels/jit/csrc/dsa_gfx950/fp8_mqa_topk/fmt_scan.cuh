@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Fused FP8 MQA logits + top-k (gfx950): the scan kernel family, a copy of mqa_v35wes::kernel
+// Fused FP8 MQA logits + top-k (gfx950): the scan kernel, a copy of mqa_v35wes::kernel
 // (csrc/kernels/fp8_mqa_logits.cu) with two output modes:
 //
-//   MODE_DENSE  fp32 logits store exactly like v35wes (no -inf fill). With STRIDED the pipeline walks SAMPLE indices
-//               j (K row j*S, runtime stride S): K / kv_scale loads use voffset (t*S)*128 + piece*16 /
-//               (tid*S)*4 and soffset token_base*S*{128,4}; row windows become [ceil(ks/S), ceil(ke/S)) clipped to
-//               Ns = ceil(N/S); the output row stride is `out_cols`.
+//   MODE_DENSE  fp32 logits stored exactly like v35wes (no -inf fill), row stride `out_cols`. Used for the sample
+//               pass (the keys j*S gathered into their own buffer).
 //   MODE_EMIT   candidate emission: a logit is a candidate when res >= tau[row]; candidate i of row m (split s) is
 //               the u64 (n << 32) | bits(res) at cand[cand_index(s, m, i)] (interleaved pair segments, 2*CAP slots
 //               per row pair), positions from ballot/mbcnt and wave-uniform per-row counters. Exactly ONE buffer
@@ -21,15 +19,13 @@
 // Build flags: -fno-honor-nans -fno-slp-vectorize -mllvm -disable-machine-sink (see fp8_mqa_logits.cu).
 #pragma once
 #include "fmt_common.cuh"
-#include "fmt_select.cuh"
 
-namespace fmt {
+namespace mqa_topk {
 
 constexpr int MODE_DENSE = 0;
 constexpr int MODE_EMIT = 1;
-constexpr int MODE_SAMPLE = 2;   // DENSE + STRIDED sample pass + tau of every row in the tail (SplitN must be 1)
 
-#define FMT_SYNC_TILE() __syncthreads()
+#define MQA_TOPK_SYNC_TILE() __syncthreads()
 
 template <int NUM_WARPS, int SUB, int PF, int MODE, bool REVERSE_ROWS>
 __global__ __launch_bounds__(NUM_WARPS * WARP)
@@ -37,12 +33,10 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
                  const float* __restrict__ W_ptr, const int* __restrict__ ks_ptr, const int* __restrict__ ke_ptr,
                  int M, int N, int SplitN,
                  // MODE_DENSE
-                 float* __restrict__ out_ptr, int out_cols, int S,
+                 float* __restrict__ out_ptr, int out_cols,
                  // MODE_EMIT
                  const float* __restrict__ tau_ptr, unsigned long long* __restrict__ cand_ptr, int* __restrict__ cnt_ptr,
-                 int CAP,
-                 // MODE_SAMPLE: tau of every row (target from Ktop), fallback counter reset
-                 float* __restrict__ tau_out_ptr, int Ktop, int* __restrict__ fbc_reset)
+                 int CAP)
 {
     constexpr int BLOCK_M    = 4;
     constexpr int ROWS_WG    = BLOCK_M * NUM_WARPS;
@@ -55,7 +49,6 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     constexpr int STAGES     = 2;
     constexpr int NACC       = 16;
     constexpr bool EMIT      = (MODE == MODE_EMIT);
-    constexpr bool STRIDED   = (MODE == MODE_SAMPLE);
     using VecOutMFMA = __attribute__((__vector_size__(NACC * sizeof(float)))) float;
 
     __shared__ __attribute__((aligned(16))) fp8   k_lds[STAGES][STAGE_BYTES];
@@ -71,16 +64,10 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     const int m0   = m0wg + warp * BLOCK_M;
     const int pid_split = blockIdx.y;
     if (m0wg >= M) return;
-    if constexpr (MODE == MODE_SAMPLE) {
-        if (blockIdx.x == 0 && blockIdx.y == 0 && tid == 0) *fbc_reset = 0;   // fallback list of this call
-    }
 
-    // token space of the pipeline: keys (N) or sample indices (Ns = ceil(N / S))
-    const int NT = STRIDED ? FMT_CDIV(N, S) : N;
-    auto win_lo = [&](int a) -> int { return STRIDED ? (a <= 0 ? 0 : FMT_CDIV(a, S)) : a; };
-    auto win_hi = [&](int b) -> int { return STRIDED ? (b <= 0 ? 0 : FMT_CDIV(min(b, N), S)) : b; };
+    const int NT = N;   // token space of the pipeline
 
-    const int rw    = l / 16;
+    const int rw   = l / 16;
     const int col   = l % 16;
     const int nA    = col + 16 * (rw & 1);   // token within tile for the B operand (0..31)
     const int dhalf = rw / 2;                // which 16-B chunk pair of each 64-dim half
@@ -98,7 +85,7 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
             #pragma unroll
             for (int v = 0; v < NACC / 2; ++v) w2[r][v] = f32x2{0.f, 0.f};
             q_reg[r][0] = q_reg[r][1] = f8x32{}; continue; }
-        ks_reg[r] = win_lo(ks_ptr[m]); ke_reg[r] = win_hi(ke_ptr[m]);
+        ks_reg[r] = ks_ptr[m]; ke_reg[r] = ke_ptr[m];
         const int64_t qb = ((int64_t)m * NUM_HEADS + nA) * HEAD_SIZE;
         q_reg[r][0] = pack(*reinterpret_cast<const f8x16*>(&Q_ptr[qb + dhalf * 16]),
                            *reinterpret_cast<const f8x16*>(&Q_ptr[qb + (2 + dhalf) * 16]));
@@ -115,16 +102,16 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     int lo = INT_MAX, hi = 0, max_ks = 0, min_ke = INT_MAX;
     for (int r = 0; r < ROWS_WG; ++r) {
         const int m = m0wg + r;
-        if (m < M) { const int a = win_lo(ks_ptr[m]), b = win_hi(ke_ptr[m]); lo = min(lo, a); hi = max(hi, b); max_ks = max(max_ks, a); min_ke = min(min_ke, b); }
+        if (m < M) { const int a = ks_ptr[m], b = ke_ptr[m]; lo = min(lo, a); hi = max(hi, b); max_ks = max(max_ks, a); min_ke = min(min_ke, b); }
     }
     lo = __builtin_amdgcn_readfirstlane(max(lo, 0)); hi = __builtin_amdgcn_readfirstlane(min(hi, NT));
     max_ks = __builtin_amdgcn_readfirstlane(max_ks); min_ke = __builtin_amdgcn_readfirstlane(min(min_ke, NT));
     const bool empty = (lo >= hi);
     lo = empty ? 0 : (lo & ~(TILE_N - 1));
-    const int num_tiles   = empty ? 0 : FMT_CDIV(hi - lo, STAGE_TOK);   // stages
+    const int num_tiles   = empty ? 0 : MQA_TOPK_CDIV(hi - lo, STAGE_TOK);   // stages
     // clean stage range [tc0, tc1): every token of the stage is inside [ks,ke) of ALL rows of the WG, all rows exist, < NT
     const bool all_rows = (m0wg + ROWS_WG) <= M;
-    int tc0 = min(FMT_CDIV(max(max_ks - lo, 0), STAGE_TOK), num_tiles);
+    int tc0 = min(MQA_TOPK_CDIV(max(max_ks - lo, 0), STAGE_TOK), num_tiles);
     int tc1 = all_rows ? min(max((min_ke - lo) / STAGE_TOK, 0), num_tiles) : 0;
     tc1 = max(tc1, tc0);
     const int n_masked = tc0 + (num_tiles - tc1);               // stages [0,tc0) U [tc1,num_tiles), contiguous index space
@@ -135,10 +122,6 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
         if constexpr (EMIT) {
             if (l == 0)
                 for (int r = 0; r < BLOCK_M; ++r) if (m0 + r < M) cnt_ptr[(int64_t)pid_split * M + m0 + r] = 0;
-        }
-        if constexpr (MODE == MODE_SAMPLE) {
-            if (l == 0)
-                for (int r = 0; r < BLOCK_M; ++r) if (m0 + r < M) tau_out_ptr[m0 + r] = -__builtin_huge_valf();
         }
         return;
     }
@@ -156,11 +139,11 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     for (int r = 0; r < BLOCK_M; r += 2) {
         if constexpr (EMIT) {
             const int row = __builtin_amdgcn_readfirstlane(m0 + r);   // < Mp, even
-            c_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)(cand_ptr + ((int64_t)pid_split * Mp + row) * CAP), 0, 2 * CAP * 8, FMT_BUF_RSRC_WORD3);
-            o_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)cand_ptr, 0, 0, FMT_BUF_RSRC_WORD3);  // dummy stores only
+            c_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)(cand_ptr + ((int64_t)pid_split * Mp + row) * CAP), 0, 2 * CAP * 8, MQA_TOPK_BUF_RSRC_WORD3);
+            o_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)cand_ptr, 0, 0, MQA_TOPK_BUF_RSRC_WORD3);  // dummy stores only
         } else {
             const int row = __builtin_amdgcn_readfirstlane(min(m0 + r, M - 1));
-            o_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)(out_ptr + (int64_t)row * out_cols), 0, 2 * out_cols * 4, FMT_BUF_RSRC_WORD3);
+            o_rsrc[r / 2] = __builtin_amdgcn_make_buffer_rsrc((void*)(out_ptr + (int64_t)row * out_cols), 0, 2 * out_cols * 4, MQA_TOPK_BUF_RSRC_WORD3);
         }
     }
     const int o_voff = hset * out_cols * 4 + jtok * 4;
@@ -175,7 +158,7 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
 
     // ---- producer mapping: chunk c (16 B) of the tile: token c/8, 16-B piece c%8 ----
     // Each lane copies CPL chunks; the LDS destination XOR-swizzles the piece index by ((token >> 1) & 7).
-    constexpr int CPL = FMT_CDIV(CHUNKS, NTHREADS);
+    constexpr int CPL = MQA_TOPK_CDIV(CHUNKS, NTHREADS);
     static_assert(CHUNKS % NTHREADS == 0, "every lane issues exactly CPL K loads per stage (vmcnt accounting)");
     // vmcnt accounting (per wave, lower bound: K loads + output stores; wave 0's scale loads only add younger ops)
     constexpr int ST_PER_STAGE = 2 * SUB;                       // pair stores per stage
@@ -189,10 +172,9 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     for (int i = 0; i < CPL; ++i) {
         const int c = tid + i * NTHREADS;
         const int t = c / 8, pc = c % 8;            // t = token within stage (0..STAGE_TOK-1)
-        pf_voff[i]    = STRIDED ? (t * S * HEAD_SIZE + pc * 16) : c * 16;
+        pf_voff[i]    = c * 16;
         pf_lds_off[i] = t * HEAD_SIZE + ((pc ^ ((t >> 1) & 7)) * 16);
     }
-    const int kv_mul  = STRIDED ? S : 1;          // token_base (pipeline units) -> key index
     // per-lane LDS read offsets for the B operand (4 x 16 B): pieces dhalf, 2+dhalf, 4+dhalf, 6+dhalf of token nA
     const int rd_base = nA * HEAD_SIZE;
     const int sw = (nA >> 1) & 7;
@@ -291,14 +273,14 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
         u32x4* pf = slot == 0 ? pf_reg0 : slot == 1 ? pf_reg1 : slot == 2 ? pf_reg2 : pf_reg3;
         float& ps = slot == 0 ? pf_sc0 : slot == 1 ? pf_sc1 : slot == 2 ? pf_sc2 : pf_sc3;
         const int token_base = __builtin_amdgcn_readfirstlane(tokbase(t));
-        const int soff = token_base * kv_mul * HEAD_SIZE;
+        const int soff = token_base * HEAD_SIZE;
         #pragma unroll
         for (int i = 0; i < CPL; ++i)
             asm volatile("buffer_load_dwordx4 %0, %1, %2, %3 offen" : "=v"(pf[i]) : "v"(pf_voff[i]), "s"(k_v), "s"(soff) : "memory");
         if (warp < SC_WAVES)   // wave-uniform (SGPR) branch; extra younger ops only make wave 0's waits stricter
         {
-            const int sc_soff = token_base * kv_mul * 4;
-            const int sc_vo = STRIDED ? tid * S * 4 : tid * 4;   // computed here: clang does not capture plain
+            const int sc_soff = token_base * 4;
+            const int sc_vo = tid * 4;                           // computed here: clang does not capture plain
             const i32x4 sv = s_v;                                // variables named only in asm operands
             asm volatile("buffer_load_dword %0, %1, %2, %3 offen" : "=v"(ps) : "v"(sc_vo), "s"(sv), "s"(sc_soff) : "memory");
         }
@@ -323,8 +305,8 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     float pd_P0 = 0.f, pd_P1 = 0.f, pd_p2 = 0.f, pd_e3 = 0.f, pd_o3 = 0.f;
     int pd_tok = 0;
     auto dummy_store = [&]() { __builtin_amdgcn_raw_buffer_store_b32(0u, o_rsrc[0], OOB_VOFF, 0, 0); };
-    // drain: wait for the clamped, never-used inline-asm prefetches before their VGPRs can be reused (see the same
-    // macro in fmt_fused.cuh; tools/asmloadwaw.py)
+    // drain: wait for the clamped, never-used inline-asm prefetches before their VGPRs can be reused. The compiler does
+    // not track inline-asm load destinations, so it may otherwise reuse them while the loads are still in flight.
     static_assert(CPL == 1, "drain operand list assumes one chunk per lane");
     auto drain_prefetch = [&]() {
         if constexpr (PF == 4)
@@ -414,12 +396,12 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
         write_lds(IC<WS>{}, IC<NXT>{}, IC<WC>{});                                                        \
         issue_loads(min((TT) + PF + 1, te - 1), IC<WS>{});                                               \
         if constexpr (SUB == 2) {                                                                         \
-            SUBTILE(0, 1, stage_base, read_lds(Bo[1], IC<CUR>{}, IC<1>{}), MK, P0, 1, 0, FMT_SYNC_TILE()) \
+            SUBTILE(0, 1, stage_base, read_lds(Bo[1], IC<CUR>{}, IC<1>{}), MK, P0, 1, 0, MQA_TOPK_SYNC_TILE()) \
             SUBTILE(1, 0, stage_base + TILE_N, NEXT_STAGE_READ(NXT), MK, true, 3, 2, (void)0)            \
         } else {                                                                                          \
             SUBTILE(0, 1, stage_base, read_lds(Bo[1], IC<CUR>{}, IC<1>{}), MK, P0, 1, -1, (void)0)       \
             SUBTILE(1, 0, stage_base + TILE_N, read_lds(Bo[0], IC<CUR>{}, IC<2>{}), MK, true, 0, -1, (void)0) \
-            SUBTILE(0, 1, stage_base + 2 * TILE_N, read_lds(Bo[1], IC<CUR>{}, IC<3>{}), MK, true, 3, -1, FMT_SYNC_TILE()) \
+            SUBTILE(0, 1, stage_base + 2 * TILE_N, read_lds(Bo[1], IC<CUR>{}, IC<3>{}), MK, true, 3, -1, MQA_TOPK_SYNC_TILE()) \
             SUBTILE(1, 0, stage_base + 3 * TILE_N, NEXT_STAGE_READ(NXT), MK, true, 2, -1, (void)0)        \
         }                                                                                                 \
     }
@@ -468,7 +450,7 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     };
 
     // ---- work split: masked stages and clean stages are each shared across the SplitN workgroups ----
-    auto share = [&](int n, int& b_, int& e_) { const int per = FMT_CDIV(n, SplitN); b_ = pid_split * per; e_ = min(n, b_ + per); };
+    auto share = [&](int n, int& b_, int& e_) { const int per = MQA_TOPK_CDIV(n, SplitN); b_ = pid_split * per; e_ = min(n, b_ + per); };
     int mb, me, cb, ce;
     share(n_masked, mb, me);
     share(tc1 - tc0, cb, ce); cb += tc0; ce += tc0;
@@ -476,31 +458,6 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     wait_vmcnt<0>();   // no asm prefetch load may still be in flight when the next pipeline reuses its VGPRs
     run_pipeline(std::false_type{}, cb, ce);
     wait_vmcnt<0>();
-    if constexpr (MODE == MODE_SAMPLE) {
-        if (Ktop <= 0) return;   // debug: sample pass only
-        // tau of my 4 rows from the samples this wave just stored (coherent re-reads); k_lds is free after the barrier
-        __syncthreads();
-        __shared__ uint32_t hist_lds[NUM_WARPS][256];
-        uint32_t* hist = hist_lds[warp];
-        float t4[4];
-#ifndef FMT_TAU_DEBUG
-#define FMT_TAU_DEBUG 0
-#endif
-#if FMT_TAU_DEBUG == 1
-        t4[0] = t4[1] = t4[2] = t4[3] = -__builtin_huge_valf();
-#elif FMT_TAU_DEBUG == 2
-        { float acc = 0.f; const float* r0 = out_ptr + (int64_t)m0 * out_cols;
-          #pragma unroll
-          for (int j = 0; j < 64; ++j) acc += r0[min(j * WARP + l, 4 * out_cols - 1)];
-          t4[0] = t4[1] = t4[2] = t4[3] = (acc == 12345.f) ? 0.f : -__builtin_huge_valf(); }
-#else
-        wave_tau4<false>(out_ptr, out_cols, NT, S, m0, M, N, ks_ptr, ke_ptr, Ktop, CAP, hist, l, t4);   // same-CU RAW after vmcnt(0): coherent
-#endif
-        if (l == 0) {
-            #pragma unroll
-            for (int r = 0; r < BLOCK_M; ++r) if (m0 + r < M) tau_out_ptr[m0 + r] = t4[r];
-        }
-    }
     if constexpr (EMIT) {
         if (l == 0) {
             #pragma unroll
@@ -509,4 +466,4 @@ void scan_kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, c
     }
 }
 
-}  // namespace fmt
+}  // namespace mqa_topk
