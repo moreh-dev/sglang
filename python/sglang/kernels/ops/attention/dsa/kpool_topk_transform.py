@@ -66,7 +66,11 @@ def fast_kpool_topk_transform_fused(
     row_starts: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
     page_table_row_index: Optional[torch.Tensor] = None,
+    out_col_align: int = 1,
 ) -> torch.Tensor:
+    """``out_col_align`` > 1 rounds the output width up to a multiple of it; the
+    extra columns are -1, so a consumer that pads the table to a block multiple
+    (TileLang's 64-column blocks) finds it already padded."""
     assert score.dim() == 2
     group_topk = _check_transform_args(
         rows=score.shape[0],
@@ -79,6 +83,7 @@ def fast_kpool_topk_transform_fused(
     )
 
     out_cols = topk + (kpool - 1 if seq_lens is not None else 0)
+    out_cols = -(-out_cols // out_col_align) * out_col_align
     dst_token_indices = score.new_empty((score.shape[0], out_cols), dtype=torch.int32)
 
     module = _jit_kpool_topk_transform_module(group_topk)
