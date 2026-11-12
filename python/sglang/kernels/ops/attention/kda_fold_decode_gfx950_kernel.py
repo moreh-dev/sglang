@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""AITER's gfx950 packed KDA decode kernel (aiter/ops/triton/_gluon_kernels/gfx950/attention/
-kda_decode.py at aiter 285579b6, byte-identical to 0.1.25 and 0.1.26) with a FOLD_GATES path: each
-(sequence, head) workgroup computes its raw gate W_fb[head] @ f_a and output gate W_gb[head] @ g_a
-as fp32 mat-vecs instead of reading g and out_gate. Launched by kda_fold_decode_gfx950.py."""
+"""AITER's gfx950 packed KDA decode kernel with the gate fold (FOLD_GATES): each
+(sequence, head) workgroup computes its decay gate W_fb[head] @ f_a and its output gate
+W_gb[head] @ g_a as fp32 mat-vecs instead of reading g and out_gate.
+
+Copied byte for byte below this docstring from moreh-dev/rocm-aiter#17 (2890af638),
+aiter/ops/triton/_gluon_kernels/gfx950/attention/kda_decode.py. Launched by
+kda_fold_decode_gfx950.py."""
 
 
 import math
@@ -72,64 +75,6 @@ def _token(
 
 
 @gluon.jit
-def _matvec(w, x):
-    """[N] = w [N, K] @ x [K] in fp32 (bf16 operands)."""
-    return gl.sum(w.to(gl.float32) * x.to(gl.float32)[None, :], axis=1)
-
-
-@gluon.jit
-def _fence(x, PACK: gl.constexpr):
-    """x, through an identity asm with a memory clobber: memory ops do not cross it, and what uses the result cannot
-    be scheduled above it (so the wait for x lands here, after everything queued before it)."""
-    return gl.inline_asm_elementwise(
-        "v_mov_b32 $0, $1", "=v,v,~{memory}", [x], dtype=x.dtype, is_pure=False, pack=PACK
-    )
-
-
-@gluon.jit
-def _token_fold(
-    x,
-    h0,
-    h1,
-    h2,
-    w0,
-    w1,
-    w2,
-    w3,
-    wf,
-    fa,
-    hb,
-    ho,
-    m,
-    s_pos,
-    a_exp,
-    dt,
-    gate_c,
-    G_LAYOUT: gl.constexpr,
-    USE_GATE_IN_KERNEL: gl.constexpr,
-    USE_LOWER_BOUND: gl.constexpr,
-    FOLD_DEBUG: gl.constexpr,
-):
-    """_token's math with f_b folded in, on operands already loaded: the raw gate row is W_fb[head] @ f_a, an fp32
-    mat-vec, then the conv (and its state update) and the gate chain as _token does them."""
-    if FOLD_DEBUG == 1 or FOLD_DEBUG == 3:  # diagnostics: no mat-vec (wrong values, timing only)
-        gf = gl.convert_layout(fa.to(gl.float32), G_LAYOUT)
-    else:
-        gf = gl.convert_layout(_matvec(wf, fa), G_LAYOUT)
-    x = gl.where(m, x.to(gl.float32), gf[None, :])
-    acc = h0.to(gl.float32) * w0 + h1.to(gl.float32) * w1
-    acc += h2.to(gl.float32) * w2 + x * w3
-    gl.amd.cdna4.buffer_store(h1, hb, ho, mask=m, cache=".cs")
-    gl.amd.cdna4.buffer_store(h2, hb, ho + s_pos, mask=m, cache=".cs")
-    gl.amd.cdna4.buffer_store(
-        x.to(hb.dtype.element_ty), hb, ho + 2 * s_pos, mask=m, cache=".cs"
-    )
-    return _finish(
-        x, acc, m, a_exp, dt, gate_c, True, USE_GATE_IN_KERNEL, USE_LOWER_BOUND
-    )
-
-
-@gluon.jit
 def _finish(
     x,
     acc,
@@ -157,6 +102,50 @@ def _finish(
     return gl.where(m, acc, a)
 
 
+@gluon.jit
+def _matvec(w, x):
+    """w [N, K] @ x [K] in fp32."""
+    return gl.sum(w.to(gl.float32) * x.to(gl.float32)[None, :], axis=1)
+
+
+@gluon.jit
+def _token_fold(
+    x,
+    h0,
+    h1,
+    h2,
+    w0,
+    w1,
+    w2,
+    w3,
+    gw,
+    gi,
+    hb,
+    ho,
+    m,
+    s_pos,
+    a_exp,
+    dt,
+    gate_c,
+    G_LAYOUT: gl.constexpr,
+    USE_GATE_IN_KERNEL: gl.constexpr,
+    USE_LOWER_BOUND: gl.constexpr,
+):
+    """_token for FOLD_GATES: row 2 is gw @ gi. The caller loads the operands."""
+    g = gl.convert_layout(_matvec(gw, gi), G_LAYOUT)
+    x = gl.where(m, x.to(gl.float32), g[None, :])
+    acc = h0.to(gl.float32) * w0 + h1.to(gl.float32) * w1
+    acc += h2.to(gl.float32) * w2 + x * w3
+    gl.amd.cdna4.buffer_store(h1, hb, ho, mask=m, cache=".cs")
+    gl.amd.cdna4.buffer_store(h2, hb, ho + s_pos, mask=m, cache=".cs")
+    gl.amd.cdna4.buffer_store(
+        x.to(hb.dtype.element_ty), hb, ho + 2 * s_pos, mask=m, cache=".cs"
+    )
+    return _finish(
+        x, acc, m, a_exp, dt, gate_c, True, USE_GATE_IN_KERNEL, USE_LOWER_BOUND
+    )
+
+
 _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
     "fused_recurrent_kda_packed_decode_kernel",
     [
@@ -168,8 +157,6 @@ _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
         "USE_RMS_GATE",
         "RESIDENT_STATE",
         "FOLD_GATES",
-        "FOLD_FENCE",
-        "XCD_REMAP",
     ],
 )
 
@@ -244,19 +231,13 @@ def fused_recurrent_kda_packed_decode_kernel(
     USE_RMS_GATE: gl.constexpr = False,
     TDM_STORE_BUFS: gl.constexpr = 2,
     RESIDENT_STATE: gl.constexpr = False,  # multi-token: state held in registers
-    fa_ptr=None,  # FOLD_GATES: f_a / g_a, the token's [K] slices of the in_proj output
-    ga_ptr=None,
-    wfb_ptr=None,  # FOLD_GATES: f_b / g_b weights, [HV * K, K] (out x in), contiguous
-    wgb_ptr=None,
-    stride_fa_token: gl.constexpr = 0,
-    stride_ga_token: gl.constexpr = 0,
-    FOLD_GATES: gl.constexpr = False,
-    FOLD_FENCE: gl.constexpr = 0,  # 0: none; 1: W_fb, f_a, g_a; 2: also q|k|v and the conv taps
-    FOLD_OG_CHUNK: gl.constexpr = 0,  # W_gb queued at this row chunk, g_b after the chunks; < 0: with W_fb
-    FOLD_OG: gl.constexpr = True,  # False: fold f_b only, the output gate is read from out_gate as before
-    FOLD_DEBUG: gl.constexpr = 0,  # timing diagnostics, wrong values: 1 no mat-vecs, 2 one W slice for all heads,
-    # 3 no weight loads
-    XCD_REMAP: gl.constexpr = True,
+    gate_in_ptr=None,  # FOLD_GATES: [K] inputs of the two gate projections, per token
+    out_gate_in_ptr=None,
+    gate_weight_ptr=None,  # FOLD_GATES: [HV * K, K] weights of the two gate projections
+    out_gate_weight_ptr=None,
+    stride_gate_in_token: gl.constexpr = 0,
+    stride_out_gate_in_token: gl.constexpr = 0,
+    FOLD_GATES: gl.constexpr = False,  # compute g and out_gate from their projections
 ):
     gl.static_assert(STATE_V_FIRST, "gfx950 kda decode keeps the state [V, K]")
     gl.static_assert(BV == V and K == V, "gfx950 kda decode needs BV == V == K")
@@ -307,7 +288,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     LP: gl.constexpr = H * K
 
     pid = gl.program_id(0)
-    if USE_CONV and XCD_REMAP:
+    if USE_CONV:
         npid = gl.num_programs(0)
         xcd = pid % 8
         tall = (npid - 1) % 8 + 1
@@ -391,23 +372,22 @@ def fused_recurrent_kda_packed_decode_kernel(
     if FOLD_GATES:
         gl.static_assert(
             USE_GATE_IN_KERNEL and USE_RMS_GATE and USE_CONV and not RESIDENT_STATE,
-            "FOLD_GATES folds f_b / g_b of the packed one-token decode",
+            "FOLD_GATES needs the fused decode without the resident state",
         )
+        gl.static_assert(K == 128, "FOLD_GATES needs K == 128")
         MV: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [NUM_WARPS, 1], [1, 0])
         ii = gl.arange(0, K, layout=gl.SliceLayout(0, MV))
         w_off = gl.arange(0, K, layout=gl.SliceLayout(1, MV))[:, None] * K + ii[None, :]
-        if FOLD_DEBUG == 2:
-            wf_p = wfb_ptr
-            wg_p = wgb_ptr
-        else:
-            wf_p = wfb_ptr + i_hv * (K * K)
-            wg_p = wgb_ptr + i_hv * (K * K)
-        # row 2 of the q|k|g|v tile is computed, not loaded: point it at q (a duplicate load of 2 * K bytes)
+        gw_p = gate_weight_ptr + i_hv * (K * K)
+        ogw_p = out_gate_weight_ptr + i_hv * (K * K)
+        # Row 2 of the q|k|g|v tile is computed. Its load reads q again.
         xp = gl.where(r == 0, q_p, gl.where(r == 1, k_p, gl.where(m, v_p, q_p))) + c
         xs = gl.where(
             r == 0,
             stride_q_token,
-            gl.where(r == 1, stride_k_token, gl.where(m, stride_v_token, stride_q_token)),
+            gl.where(
+                r == 1, stride_k_token, gl.where(m, stride_v_token, stride_q_token)
+            ),
         )
     if PAD_SLOT_GUARD and slot <= 0:
         zero = gl.full([V], 0.0, o_ptr.dtype.element_ty, OUT)
@@ -504,7 +484,7 @@ def fused_recurrent_kda_packed_decode_kernel(
         else:
             if not IS_BETA_HEADWISE:
                 b = gl.load(b_p).to(gl.float32)
-            if USE_RMS_GATE and not (FOLD_GATES and FOLD_OG):
+            if USE_RMS_GATE and not FOLD_GATES:
                 og = gl.amd.cdna4.buffer_load(og_p, off_o)
         if RESIDENT_STATE:
             if USE_CONV:
@@ -532,20 +512,20 @@ def fused_recurrent_kda_packed_decode_kernel(
             )
         else:
             if FOLD_GATES:
-                # this token's inputs, queued ahead of its state slab (loaded in the loop: no loop-invariant part
-                # of the mat-vec for LICM to hoist above the slab)
+                # Queue the token inputs before the state slab. These loads stay in
+                # the loop, or LICM moves the mat-vec and its wait above the slab.
                 x = gl.load(xp)
                 h0, h1, h2, w0, w1, w2, w3 = _conv_load(
                     hb, conv_weight_ptr, ho, wo, m, stride_cs_pos, LP
                 )
-                if FOLD_DEBUG != 3:
-                    wf = gl.amd.cdna4.buffer_load(wf_p, w_off)
-                else:
-                    wf = fa_ptr  # unused
-                fa = gl.amd.cdna4.buffer_load(fa_ptr + (tok0 + t) * stride_fa_token, ii)
-                ga = gl.amd.cdna4.buffer_load(ga_ptr + (tok0 + t) * stride_ga_token, ii)
-                if FOLD_OG and FOLD_OG_CHUNK < 0 and FOLD_DEBUG != 3:
-                    wg = gl.amd.cdna4.buffer_load(wg_p, w_off)
+                gw = gl.amd.cdna4.buffer_load(gw_p, w_off)
+                gi = gl.amd.cdna4.buffer_load(
+                    gate_in_ptr + (tok0 + t) * stride_gate_in_token, ii
+                )
+                ogi = gl.amd.cdna4.buffer_load(
+                    out_gate_in_ptr + (tok0 + t) * stride_out_gate_in_token, ii
+                )
+                ogw = gl.amd.cdna4.buffer_load(ogw_p, w_off)
             bufs = ()
             for i in gl.static_range(NUM_BUFFERS):
                 bufs = bufs + (
@@ -554,22 +534,6 @@ def fused_recurrent_kda_packed_decode_kernel(
                     ),
                 )
             if FOLD_GATES:
-                if FOLD_FENCE >= 1 or FOLD_DEBUG == 1:  # DEBUG 1 keeps the weight loads alive through the fence
-                    if FOLD_DEBUG != 3:
-                        wf = _fence(wf, 2)
-                    fa = _fence(fa, 2)
-                    ga = _fence(ga, 2)
-                    if FOLD_OG and FOLD_OG_CHUNK < 0 and FOLD_DEBUG != 3:
-                        wg = _fence(wg, 2)
-                if FOLD_FENCE >= 2:
-                    x = _fence(x, 2)
-                    h0 = _fence(h0, 2)
-                    h1 = _fence(h1, 2)
-                    h2 = _fence(h2, 2)
-                    w0 = _fence(w0, 1)
-                    w1 = _fence(w1, 1)
-                    w2 = _fence(w2, 1)
-                    w3 = _fence(w3, 1)
                 y = _token_fold(
                     x,
                     h0,
@@ -579,8 +543,8 @@ def fused_recurrent_kda_packed_decode_kernel(
                     w1,
                     w2,
                     w3,
-                    wf,
-                    fa,
+                    gw,
+                    gi,
                     hb,
                     ho,
                     m,
@@ -591,13 +555,8 @@ def fused_recurrent_kda_packed_decode_kernel(
                     gl.SliceLayout(0, FLAT),
                     USE_GATE_IN_KERNEL,
                     USE_LOWER_BOUND,
-                    FOLD_DEBUG,
                 )
-                if FOLD_OG and FOLD_OG_CHUNK < 0:
-                    if FOLD_DEBUG == 1 or FOLD_DEBUG == 3:
-                        og = gl.convert_layout(ga.to(gl.float32), OUT)
-                    else:
-                        og = gl.convert_layout(_matvec(wg, ga), OUT)
+                og = gl.convert_layout(_matvec(ogw, ogi), OUT)
             else:
                 y = _token(
                     xp,
@@ -648,8 +607,6 @@ def fused_recurrent_kda_packed_decode_kernel(
         for i in gl.static_range(NC):
             vvs = vvs + (qkav_smem.slice(3 * K, K).gather(rows + i, 0),)
         for i in gl.static_range(NC):
-            if FOLD_GATES and FOLD_OG and i == FOLD_OG_CHUNK and FOLD_DEBUG != 3:
-                wg = gl.amd.cdna4.buffer_load(wg_p, w_off)
             if RESIDENT_STATE:
                 S = st[i]
             else:
@@ -692,13 +649,6 @@ def fused_recurrent_kda_packed_decode_kernel(
             ss += o * o
         if RESIDENT_STATE:
             st = upd
-        if FOLD_GATES and FOLD_OG and FOLD_OG_CHUNK >= 0:
-            if FOLD_DEBUG == 1:
-                wg = _fence(wg, 2)
-            if FOLD_DEBUG == 1 or FOLD_DEBUG == 3:
-                og = gl.convert_layout(ga.to(gl.float32), OUT)
-            else:
-                og = gl.convert_layout(_matvec(wg, ga), OUT)
         if USE_RMS_GATE:
             sbuf.store(ss)
         o = obuf.gather(o_idx, 0)

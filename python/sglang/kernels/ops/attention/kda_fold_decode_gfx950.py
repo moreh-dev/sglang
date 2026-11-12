@@ -6,8 +6,9 @@ W_gb @ g_a, fp32), the q/k/v short convolution and its state update, the bounded
 delta-rule recurrence on the paged fp32 state, and the sigmoid-gated RMSNorm. The unfused chain
 is fused_fg_b_proj + causal_conv1d_update + the recurrent decode kernel + o_norm.
 
-The kernel is kda_fold_decode_gfx950_kernel.py; it launches with AITER's packed-decode config
-and constexprs for this case, plus the fold arguments.
+The kernel is kda_fold_decode_gfx950_kernel.py (moreh-dev/rocm-aiter#17); it launches with the
+constexprs and the `fused` config bucket that AITER's fused_recurrent_kda_packed_decode passes for
+this call, plus the fold arguments.
 """
 
 from __future__ import annotations
@@ -17,9 +18,6 @@ from functools import lru_cache
 import torch
 
 from sglang.kernels.arch import current_arch
-
-# -1 queues W_gb with W_fb; the fastest variant measured at 8-32 heads per rank, batch 1-128.
-_FOLD_OG_CHUNK = -1
 
 
 @lru_cache(maxsize=1)
@@ -92,7 +90,7 @@ def kda_fold_decode(
         q_ptr=mixed_qkv,
         k_ptr=mixed_qkv[:, D:],
         v_ptr=mixed_qkv[:, 2 * D :],
-        g_ptr=mixed_qkv,  # unused with FOLD_GATES
+        g_ptr=mixed_qkv,  # not read with FOLD_GATES
         beta_ptr=beta,
         A_log_ptr=A_log,
         dt_bias_ptr=dt_bias,
@@ -104,7 +102,7 @@ def kda_fold_decode(
         num_accepted_ptr=None,
         conv_state_ptr=conv_state,
         conv_weight_ptr=conv_weight,
-        out_gate_ptr=mixed_qkv,  # unused with FOLD_GATES
+        out_gate_ptr=mixed_qkv,  # not read with FOLD_GATES
         norm_weight_ptr=norm_weight,
         lower_bound=lower_bound,
         norm_eps=norm_eps,
@@ -157,18 +155,13 @@ def kda_fold_decode(
         USE_CONV=True,
         USE_RMS_GATE=True,
         RESIDENT_STATE=False,
-        fa_ptr=f_a,
-        ga_ptr=g_a,
-        wfb_ptr=w_fb,
-        wgb_ptr=w_gb,
-        stride_fa_token=f_a.stride(0),
-        stride_ga_token=g_a.stride(0),
+        gate_in_ptr=f_a,
+        out_gate_in_ptr=g_a,
+        gate_weight_ptr=w_fb,
+        out_gate_weight_ptr=w_gb,
+        stride_gate_in_token=f_a.stride(0),
+        stride_out_gate_in_token=g_a.stride(0),
         FOLD_GATES=True,
-        FOLD_FENCE=0,
-        FOLD_OG_CHUNK=_FOLD_OG_CHUNK,
-        FOLD_OG=True,
-        FOLD_DEBUG=0,
-        XCD_REMAP=True,
         num_warps=cfg["num_warps"],
         enable_fp_fusion=True,
     )
